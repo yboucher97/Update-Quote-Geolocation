@@ -171,8 +171,11 @@ Change these in the same env file:
 - `ZOHO_QUOTE_SHIPPING_COUNTRY_FIELD`
 - `ZOHO_QUOTE_LATITUDE_FIELD`
 - `ZOHO_QUOTE_LONGITUDE_FIELD`
+- `ZOHO_QUOTE_COORD_DECIMALS`
+- `ZOHO_QUOTE_COORD_MAX_LENGTH`
 
 The latitude and longitude values must match your real Zoho CRM field API names.
+By default, the updater rounds coordinates to 9 decimal places and keeps the rendered value at or under 16 characters before sending it to Zoho.
 
 ## Commands
 
@@ -212,6 +215,15 @@ Show installed version:
 
 ```bash
 update-quote-geolocation --version
+```
+
+If your Zoho coordinate fields are stricter, override the default formatting:
+
+```bash
+update-quote-geolocation sync \
+  --max-records 5 \
+  --coordinate-decimals 6 \
+  --coordinate-max-length 16
 ```
 
 ## Excel exception report

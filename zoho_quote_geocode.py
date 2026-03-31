@@ -9,6 +9,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlsplit, urlunsplit
@@ -113,6 +114,27 @@ def _json_string(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False) if value is not None else ""
 
 
+def _normalize_coordinate(value: float, decimal_places: int, max_length: int) -> float:
+    try:
+        decimal_value = Decimal(str(value))
+    except InvalidOperation as exc:
+        raise ConfigError(f"Invalid coordinate value: {value}") from exc
+
+    quantizer = Decimal("1").scaleb(-decimal_places)
+    rounded = decimal_value.quantize(quantizer, rounding=ROUND_HALF_UP)
+    rendered = format(rounded, "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+
+    if len(rendered) > max_length:
+        raise ConfigError(
+            f"Coordinate '{rendered}' exceeds the configured Zoho field length limit of {max_length}. "
+            "Lower ZOHO_QUOTE_COORD_DECIMALS or increase the CRM field length."
+        )
+
+    return float(rendered)
+
+
 @dataclass(slots=True)
 class ZohoAuthConfig:
     api_base_url: str
@@ -135,6 +157,8 @@ class QuoteFieldConfig:
     country_field: str
     latitude_field: str | None
     longitude_field: str | None
+    coordinate_decimal_places: int
+    coordinate_max_length: int
 
     def requested_fields(self) -> list[str]:
         fields = [
@@ -321,11 +345,22 @@ class ZohoCrmClient:
                 "--latitude-field and --longitude-field."
             )
 
+        safe_latitude = _normalize_coordinate(
+            latitude,
+            decimal_places=self.field_config.coordinate_decimal_places,
+            max_length=self.field_config.coordinate_max_length,
+        )
+        safe_longitude = _normalize_coordinate(
+            longitude,
+            decimal_places=self.field_config.coordinate_decimal_places,
+            max_length=self.field_config.coordinate_max_length,
+        )
+
         payload = {
             "data": [
                 {
-                    self.field_config.latitude_field: latitude,
-                    self.field_config.longitude_field: longitude,
+                    self.field_config.latitude_field: safe_latitude,
+                    self.field_config.longitude_field: safe_longitude,
                 }
             ]
         }
@@ -755,6 +790,18 @@ def build_parser() -> argparse.ArgumentParser:
             help="Shipping country field API name.",
         )
         current_parser.add_argument(
+            "--coordinate-decimals",
+            type=int,
+            default=int(_read_env("ZOHO_QUOTE_COORD_DECIMALS", default="9") or "9"),
+            help="Maximum decimal places sent to Zoho for latitude/longitude fields.",
+        )
+        current_parser.add_argument(
+            "--coordinate-max-length",
+            type=int,
+            default=int(_read_env("ZOHO_QUOTE_COORD_MAX_LENGTH", default="16") or "16"),
+            help="Maximum total character length sent to Zoho for latitude/longitude fields.",
+        )
+        current_parser.add_argument(
             "--page-size",
             type=int,
             default=int(_read_env("ZOHO_CRM_PAGE_SIZE", default="200") or "200"),
@@ -852,6 +899,8 @@ def _build_configs(args: argparse.Namespace) -> tuple[ZohoAuthConfig, QuoteField
         country_field=args.country_field,
         latitude_field=getattr(args, "latitude_field", None),
         longitude_field=getattr(args, "longitude_field", None),
+        coordinate_decimal_places=args.coordinate_decimals,
+        coordinate_max_length=args.coordinate_max_length,
     )
     return zoho_config, field_config
 
