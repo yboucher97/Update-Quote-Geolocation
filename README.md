@@ -9,7 +9,7 @@ It fetches quotes from Zoho CRM, builds a list of quote IDs plus shipping addres
 - A local Python script for direct use from the repo
 - A Debian package named `update-quote-geolocation`
 - A GitHub Actions workflow that rebuilds and republishes the APT repo on every push to `main`
-- A GitHub Pages APT repository so Linux machines can install and upgrade with `apt`
+- A GitHub-hosted APT repository published from the `gh-pages` branch so Linux machines can install and upgrade with `apt`
 
 ## Files
 
@@ -58,10 +58,10 @@ The installed command automatically loads configuration from:
 
 ## APT install
 
-Once GitHub Pages is publishing this repo, install on Ubuntu or Debian with:
+Install on Ubuntu or Debian with:
 
 ```bash
-curl -fsSL https://yboucher97.github.io/Update-Quote-Geolocation/update-quote-geolocation.list | sudo tee /etc/apt/sources.list.d/update-quote-geolocation.list >/dev/null
+curl -fsSL https://raw.githubusercontent.com/yboucher97/Update-Quote-Geolocation/gh-pages/update-quote-geolocation.list | sudo tee /etc/apt/sources.list.d/update-quote-geolocation.list >/dev/null
 sudo apt update
 sudo apt install update-quote-geolocation
 ```
@@ -72,7 +72,7 @@ Every push to `main` triggers `.github/workflows/publish-apt.yml`, which:
 
 1. builds a new Debian package version
 2. rebuilds the APT repository
-3. republishes the repository to GitHub Pages
+3. republishes the `gh-pages` branch
 
 To pull the newest version on Linux:
 
@@ -208,7 +208,7 @@ update-quote-geolocation --version
 - Quotes that already have both latitude and longitude are skipped unless you pass `--update-existing`.
 - With refresh-token auth, the script uses Zoho's returned `api_domain` to adapt to your data center automatically.
 - The generated APT source uses `trusted=yes`. If you want a signed APT repository, add GPG signing as a later step.
-- GitHub Pages must be reachable for remote `apt install` to work.
+- The public APT source is served from the `gh-pages` branch through `raw.githubusercontent.com`.
 
 ## References
 

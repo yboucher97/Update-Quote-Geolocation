@@ -8,7 +8,7 @@ DEB_PATH="${ROOT_DIR}/dist/deb/${PACKAGE_NAME}_${PACKAGE_VERSION}_all.deb"
 REPO_ROOT="${ROOT_DIR}/dist/apt-repo"
 POOL_DIR="${REPO_ROOT}/pool/main/u/${PACKAGE_NAME}"
 DIST_ROOT="${REPO_ROOT}/dists/stable/main"
-SITE_URL="${SITE_URL:-https://yboucher97.github.io/Update-Quote-Geolocation}"
+SITE_URL="${SITE_URL:-https://raw.githubusercontent.com/yboucher97/Update-Quote-Geolocation/gh-pages}"
 
 if [ ! -f "${DEB_PATH}" ]; then
   echo "Missing Debian package: ${DEB_PATH}" >&2
@@ -102,7 +102,7 @@ cat > "${REPO_ROOT}/index.html" <<EOF
   <main>
     <div class="panel">
       <h1>Update Quote Geolocation</h1>
-      <p>This GitHub Pages site hosts the APT repository for the <code>update-quote-geolocation</code> package.</p>
+      <p>This branch snapshot hosts the APT repository for the <code>update-quote-geolocation</code> package.</p>
       <h2>Install</h2>
       <pre><code>curl -fsSL ${SITE_URL}/update-quote-geolocation.list | sudo tee /etc/apt/sources.list.d/update-quote-geolocation.list >/dev/null
 sudo apt update

@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PACKAGE_VERSION: 0.1.${{ github.run_number }}
-      SITE_URL: https://yboucher97.github.io/Update-Quote-Geolocation
+      SITE_URL: https://raw.githubusercontent.com/yboucher97/Update-Quote-Geolocation/gh-pages
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
