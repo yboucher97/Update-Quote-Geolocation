@@ -431,7 +431,7 @@ ZOHO_QUOTE_WEBHOOK_SECRET=your_shared_secret
 Webhook request:
 
 ```http
-POST /webhooks/quote-geolocation
+POST /webhooks/zoho/quote-geolocation
 Content-Type: application/json
 X-Webhook-Secret: your_shared_secret
 
@@ -448,17 +448,17 @@ Optional JSON body flags:
 Health check:
 
 ```http
-GET /health
+GET /health/quote-geolocation
 ```
 
 Example Caddy route:
 
 ```caddyfile
-handle /webhooks/quote-geolocation* {
+handle /webhooks/zoho/quote-geolocation* {
     reverse_proxy 127.0.0.1:8050
 }
 
-handle /health {
+handle /health/quote-geolocation {
     reverse_proxy 127.0.0.1:8050
 }
 ```
