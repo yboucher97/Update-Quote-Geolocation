@@ -355,6 +355,14 @@ class GeocodeResult:
         }
 
 
+@dataclass(slots=True)
+class CoordinateContext:
+    latitude: float
+    longitude: float
+    source: str
+    sync_status: str | None = None
+
+
 def _split_ring_points(points: list[tuple[float, float]], parts: list[int]) -> list[list[tuple[float, float]]]:
     ring_starts = list(parts) + [len(points)]
     rings: list[list[tuple[float, float]]] = []
@@ -768,6 +776,21 @@ def _build_record_item(record: QuoteAddressRecord, fields: QuoteFieldConfig) -> 
     return item
 
 
+def _effective_coordinate_context(
+    record: QuoteAddressRecord,
+    coordinate_contexts: dict[str, CoordinateContext] | None = None,
+) -> CoordinateContext | None:
+    if coordinate_contexts and record.quote_id in coordinate_contexts:
+        return coordinate_contexts[record.quote_id]
+    if record.current_latitude is None or record.current_longitude is None:
+        return None
+    return CoordinateContext(
+        latitude=record.current_latitude,
+        longitude=record.current_longitude,
+        source="zoho_current",
+    )
+
+
 def _admin_target_specs(
     record: QuoteAddressRecord,
     fields: QuoteFieldConfig,
@@ -1139,6 +1162,10 @@ def _build_run_report(
             "arrond_match_source": region_item.get("arrond_match_source"),
             "region_start_latitude": region_item.get("current_latitude"),
             "region_start_longitude": region_item.get("current_longitude"),
+            "region_effective_latitude": region_item.get("effective_latitude"),
+            "region_effective_longitude": region_item.get("effective_longitude"),
+            "region_coordinate_source": region_item.get("coordinate_source"),
+            "region_coordinate_source_sync_status": region_item.get("coordinate_source_sync_status"),
             "current_region_name": region_item.get("current_region_name"),
             "current_region_code": region_item.get("current_region_code"),
             "current_mrc_name": region_item.get("current_mrc_name"),
@@ -1206,6 +1233,14 @@ def _build_run_report(
             f"{region_summary.get('region_lookup_errors', 0)} lookup errors, and "
             f"{region_summary.get('update_errors', 0)} Zoho boundary update errors."
         )
+        used_fresh_geocoded = region_summary.get("used_fresh_geocoded_coordinates", 0)
+        used_existing = region_summary.get("used_existing_coordinates", 0)
+        if used_fresh_geocoded or used_existing:
+            summary_lines.append(
+                "Boundary sync used "
+                f"{used_fresh_geocoded} freshly geocoded coordinate sets from this run and "
+                f"{used_existing} existing Zoho coordinate sets."
+            )
         partial_items = [
             item
             for item in (region_payload.get("items") or [])
@@ -1306,6 +1341,10 @@ def _write_run_report(path: Path, payload: dict[str, Any], logger: logging.Logge
         "arrond_match_source",
         "region_start_latitude",
         "region_start_longitude",
+        "region_effective_latitude",
+        "region_effective_longitude",
+        "region_coordinate_source",
+        "region_coordinate_source_sync_status",
         "current_region_name",
         "current_region_code",
         "current_mrc_name",
@@ -1352,6 +1391,10 @@ def _write_run_report(path: Path, payload: dict[str, Any], logger: logging.Logge
                 row.get("arrond_match_source", ""),
                 row.get("region_start_latitude", ""),
                 row.get("region_start_longitude", ""),
+                row.get("region_effective_latitude", ""),
+                row.get("region_effective_longitude", ""),
+                row.get("region_coordinate_source", ""),
+                row.get("region_coordinate_source_sync_status", ""),
                 row.get("current_region_name", ""),
                 row.get("current_region_code", ""),
                 row.get("current_mrc_name", ""),
@@ -1401,6 +1444,10 @@ def _write_run_report(path: Path, payload: dict[str, Any], logger: logging.Logge
                 row.get("arrond_match_source", ""),
                 row.get("region_start_latitude", ""),
                 row.get("region_start_longitude", ""),
+                row.get("region_effective_latitude", ""),
+                row.get("region_effective_longitude", ""),
+                row.get("region_coordinate_source", ""),
+                row.get("region_coordinate_source_sync_status", ""),
                 row.get("current_region_name", ""),
                 row.get("current_region_code", ""),
                 row.get("current_mrc_name", ""),
@@ -1481,16 +1528,15 @@ def geocode_quote_records(
     return report
 
 
-def sync_quote_coordinates(
+def _process_quote_coordinate_sync(
+    records: list[QuoteAddressRecord],
     zoho_client: ZohoCrmClient,
     geocoder: GoogleGeocoder,
     *,
-    max_records: int | None = None,
     skip_existing: bool = True,
     dry_run: bool = False,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, CoordinateContext]]:
     logger = zoho_client.logger
-    records = fetch_quote_shipping_addresses(zoho_client, max_records=max_records)
     summary = {
         "fetched": len(records),
         "updated": 0,
@@ -1502,6 +1548,7 @@ def sync_quote_coordinates(
         "update_errors": 0,
     }
     items: list[dict[str, Any]] = []
+    coordinate_contexts: dict[str, CoordinateContext] = {}
 
     for record in records:
         item = _build_record_item(record, zoho_client.field_config)
@@ -1563,6 +1610,11 @@ def sync_quote_coordinates(
 
         item["geocode"] = geocode.to_dict()
         item["google_status"] = "OK"
+        coordinate_context = CoordinateContext(
+            latitude=geocode.latitude,
+            longitude=geocode.longitude,
+            source="google_geocode",
+        )
         item["coordinate_update_values"] = {
             "latitude": geocode.latitude,
             "longitude": geocode.longitude,
@@ -1571,6 +1623,8 @@ def sync_quote_coordinates(
         if dry_run:
             item["status"] = "dry_run"
             item["status_reason"] = "Geocoding succeeded, but CRM update was skipped because dry-run mode is enabled."
+            coordinate_context.sync_status = item["status"]
+            coordinate_contexts[record.quote_id] = coordinate_context
             summary["dry_run"] += 1
             logger.info(
                 "Quote %s geocoded successfully in dry-run mode: lat=%s long=%s",
@@ -1591,6 +1645,8 @@ def sync_quote_coordinates(
             item["status"] = "update_error"
             item["status_reason"] = "Zoho CRM rejected the latitude/longitude update."
             item["error"] = str(exc)
+            coordinate_context.sync_status = item["status"]
+            coordinate_contexts[record.quote_id] = coordinate_context
             summary["update_errors"] += 1
             logger.warning(
                 "Quote %s geocoded but Zoho update failed: %s",
@@ -1603,6 +1659,8 @@ def sync_quote_coordinates(
         item["status"] = "updated"
         item["status_reason"] = "Latitude and longitude were updated in Zoho CRM."
         item["update_response"] = update_response
+        coordinate_context.sync_status = item["status"]
+        coordinate_contexts[record.quote_id] = coordinate_context
         summary["updated"] += 1
         logger.info(
             "Quote %s updated with latitude=%s longitude=%s",
@@ -1612,19 +1670,42 @@ def sync_quote_coordinates(
         )
         items.append(item)
 
-    return {
-        "summary": summary,
-        "items": items,
-    }
+    return (
+        {
+            "summary": summary,
+            "items": items,
+        },
+        coordinate_contexts,
+    )
 
 
-def sync_quote_regions(
+def sync_quote_coordinates(
+    zoho_client: ZohoCrmClient,
+    geocoder: GoogleGeocoder,
+    *,
+    max_records: int | None = None,
+    skip_existing: bool = True,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    records = fetch_quote_shipping_addresses(zoho_client, max_records=max_records)
+    payload, _ = _process_quote_coordinate_sync(
+        records,
+        zoho_client,
+        geocoder,
+        skip_existing=skip_existing,
+        dry_run=dry_run,
+    )
+    return payload
+
+
+def _process_quote_region_sync(
+    records: list[QuoteAddressRecord],
     zoho_client: ZohoCrmClient,
     resolvers: list[RegionShapeResolver],
     *,
     arrond_resolver: RegionShapeResolver | None = None,
-    max_records: int | None = None,
     update_existing: bool = False,
+    coordinate_contexts: dict[str, CoordinateContext] | None = None,
 ) -> dict[str, Any]:
     logger = zoho_client.logger
     if not zoho_client.field_config.latitude_field or not zoho_client.field_config.longitude_field:
@@ -1652,7 +1733,6 @@ def sync_quote_regions(
             "Set ZOHO_ARRON_SHAPE_PATH or pass --arron-shape-path."
         )
 
-    records = fetch_quote_shipping_addresses(zoho_client, max_records=max_records)
     summary = {
         "fetched": len(records),
         "updated": 0,
@@ -1667,14 +1747,21 @@ def sync_quote_regions(
         "matched_by_muni": 0,
         "matched_by_mrc": 0,
         "matched_by_region": 0,
+        "used_existing_coordinates": 0,
+        "used_fresh_geocoded_coordinates": 0,
     }
     items: list[dict[str, Any]] = []
 
     for record in records:
         item = _build_record_item(record, zoho_client.field_config)
         item["missing_admin_fields"] = _remaining_admin_fields(record, zoho_client.field_config)
+        coordinate_context = _effective_coordinate_context(record, coordinate_contexts)
+        item["effective_latitude"] = coordinate_context.latitude if coordinate_context else None
+        item["effective_longitude"] = coordinate_context.longitude if coordinate_context else None
+        item["coordinate_source"] = coordinate_context.source if coordinate_context else None
+        item["coordinate_source_sync_status"] = coordinate_context.sync_status if coordinate_context else None
 
-        if record.current_latitude is None or record.current_longitude is None:
+        if coordinate_context is None:
             item["status"] = "skipped_missing_coordinates"
             item["status_reason"] = "Quote is missing latitude and/or longitude, so no polygon lookup was attempted."
             summary["skipped_missing_coordinates"] += 1
@@ -1684,6 +1771,11 @@ def sync_quote_regions(
             )
             items.append(item)
             continue
+
+        if coordinate_context.source == "google_geocode":
+            summary["used_fresh_geocoded_coordinates"] += 1
+        else:
+            summary["used_existing_coordinates"] += 1
 
         configured_admin_targets = _admin_target_specs(record, zoho_client.field_config)
         if not update_existing and configured_admin_targets and all(current_value for _, current_value, _ in configured_admin_targets):
@@ -1701,7 +1793,7 @@ def sync_quote_regions(
         try:
             boundary_match = None
             for resolver in resolvers:
-                boundary_match = resolver.lookup(record.current_longitude, record.current_latitude)
+                boundary_match = resolver.lookup(coordinate_context.longitude, coordinate_context.latitude)
                 if boundary_match is not None:
                     break
         except Exception as exc:  # pragma: no cover - unexpected shape parsing/runtime failure
@@ -1715,7 +1807,7 @@ def sync_quote_regions(
 
         try:
             arrond_match = (
-                arrond_resolver.lookup(record.current_longitude, record.current_latitude)
+                arrond_resolver.lookup(coordinate_context.longitude, coordinate_context.latitude)
                 if arrond_resolver is not None
                 else None
             )
@@ -1756,8 +1848,8 @@ def sync_quote_regions(
             logger.warning(
                 "Quote %s had no boundary match for latitude=%s longitude=%s.",
                 record.quote_id,
-                record.current_latitude,
-                record.current_longitude,
+                coordinate_context.latitude,
+                coordinate_context.longitude,
             )
             items.append(item)
             continue
@@ -1821,6 +1913,55 @@ def sync_quote_regions(
     }
 
 
+def sync_quote_regions(
+    zoho_client: ZohoCrmClient,
+    resolvers: list[RegionShapeResolver],
+    *,
+    arrond_resolver: RegionShapeResolver | None = None,
+    max_records: int | None = None,
+    update_existing: bool = False,
+) -> dict[str, Any]:
+    records = fetch_quote_shipping_addresses(zoho_client, max_records=max_records)
+    return _process_quote_region_sync(
+        records,
+        zoho_client,
+        resolvers,
+        arrond_resolver=arrond_resolver,
+        update_existing=update_existing,
+    )
+
+
+def run_quote_enrichment(
+    zoho_client: ZohoCrmClient,
+    geocoder: GoogleGeocoder,
+    resolvers: list[RegionShapeResolver],
+    *,
+    arrond_resolver: RegionShapeResolver | None = None,
+    max_records: int | None = None,
+    skip_existing: bool = True,
+    update_existing_region: bool = False,
+) -> dict[str, Any]:
+    records = fetch_quote_shipping_addresses(zoho_client, max_records=max_records)
+    sync_payload, coordinate_contexts = _process_quote_coordinate_sync(
+        records,
+        zoho_client,
+        geocoder,
+        skip_existing=skip_existing,
+    )
+    region_payload = _process_quote_region_sync(
+        records,
+        zoho_client,
+        resolvers,
+        arrond_resolver=arrond_resolver,
+        update_existing=update_existing_region,
+        coordinate_contexts=coordinate_contexts,
+    )
+    return _build_run_report(
+        sync_payload=sync_payload,
+        region_payload=region_payload,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Fetch Zoho CRM quotes, geocode shipping addresses, and enrich quotes with boundary fields."
@@ -1830,6 +1971,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     fetch_parser = subparsers.add_parser("fetch", help="Fetch quotes and export their shipping address fields.")
     sync_parser = subparsers.add_parser("sync", help="Fetch quotes, geocode shipping addresses, and update CRM.")
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Fetch once, geocode addresses, update coordinates, resolve boundaries, and write one consolidated report.",
+    )
     region_parser = subparsers.add_parser(
         "region-sync",
         help="Use quote latitude/longitude to resolve arrondissement, municipality, MRC, and region polygons and update quote fields.",
@@ -1839,7 +1984,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Combine sync and region-sync JSON outputs into one readable Excel report.",
     )
 
-    for current_parser in (fetch_parser, sync_parser, region_parser):
+    for current_parser in (fetch_parser, sync_parser, run_parser, region_parser):
         current_parser.add_argument(
             "--api-base-url",
             default=_read_env("ZOHO_CRM_API_BASE_URL", default="https://www.zohoapis.com/crm/v7"),
@@ -1927,32 +2072,34 @@ def build_parser() -> argparse.ArgumentParser:
             help="Log level.",
         )
 
-    sync_parser.add_argument(
-        "--google-api-key",
-        default=_read_env("GOOGLE_MAPS_API_KEY", "GOOGLE_GEOCODING_API_KEY"),
-        help="Google Maps Geocoding API key.",
-    )
-    sync_parser.add_argument(
-        "--update-existing",
-        action="store_true",
-        help="Update quotes even if both latitude and longitude are already populated.",
-    )
+    for geocode_parser in (sync_parser, run_parser):
+        geocode_parser.add_argument(
+            "--google-api-key",
+            default=_read_env("GOOGLE_MAPS_API_KEY", "GOOGLE_GEOCODING_API_KEY"),
+            help="Google Maps Geocoding API key.",
+        )
+        geocode_parser.add_argument(
+            "--update-existing",
+            action="store_true",
+            help="Update quotes even if both latitude and longitude are already populated.",
+        )
+        geocode_parser.add_argument(
+            "--retry-delay",
+            type=float,
+            default=float(_read_env("GOOGLE_GEOCODE_RETRY_DELAY_SECONDS", default="1") or "1"),
+            help="Delay between Google retry attempts in seconds.",
+        )
+        geocode_parser.add_argument(
+            "--max-retries",
+            type=int,
+            default=int(_read_env("GOOGLE_GEOCODE_MAX_RETRIES", default="3") or "3"),
+            help="Maximum Google Geocoding retry attempts.",
+        )
+
     sync_parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Geocode records without updating Zoho CRM.",
-    )
-    sync_parser.add_argument(
-        "--retry-delay",
-        type=float,
-        default=float(_read_env("GOOGLE_GEOCODE_RETRY_DELAY_SECONDS", default="1") or "1"),
-        help="Delay between Google retry attempts in seconds.",
-    )
-    sync_parser.add_argument(
-        "--max-retries",
-        type=int,
-        default=int(_read_env("GOOGLE_GEOCODE_MAX_RETRIES", default="3") or "3"),
-        help="Maximum Google Geocoding retry attempts.",
     )
     sync_parser.add_argument(
         "--failure-report",
@@ -1967,7 +2114,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Excel report path for quotes where Google geocoding returned ZERO_RESULTS or an API error.",
     )
 
-    for region_target_parser in (sync_parser, region_parser):
+    for region_target_parser in (sync_parser, run_parser, region_parser):
         region_target_parser.add_argument(
             "--latitude-field",
             default=_read_env("ZOHO_QUOTE_LATITUDE_FIELD"),
@@ -1979,133 +2126,142 @@ def build_parser() -> argparse.ArgumentParser:
             help="Longitude field API name in the quote module.",
         )
 
-    region_parser.add_argument(
-        "--region-name-field",
-        default=_read_env("ZOHO_QUOTE_REGION_NAME_FIELD"),
-        help="Zoho quote field API name to update with the matched region name.",
-    )
-    region_parser.add_argument(
-        "--region-code-field",
-        default=_read_env("ZOHO_QUOTE_REGION_CODE_FIELD"),
-        help="Zoho quote field API name to update with the matched region code.",
-    )
-    region_parser.add_argument(
-        "--mrc-name-field",
-        default=_read_env("ZOHO_QUOTE_MRC_NAME_FIELD"),
-        help="Zoho quote field API name to update with the matched MRC name.",
-    )
-    region_parser.add_argument(
-        "--muni-name-field",
-        default=_read_env("ZOHO_QUOTE_MUNI_NAME_FIELD"),
-        help="Zoho quote field API name to update with the matched municipality name.",
-    )
-    region_parser.add_argument(
-        "--arron-name-field",
-        default=_read_env("ZOHO_QUOTE_ARRON_NAME_FIELD"),
-        help="Zoho quote field API name to update with the matched arrondissement name.",
-    )
-    region_parser.add_argument(
-        "--arron-shape-path",
-        type=Path,
-        default=Path(_read_env("ZOHO_ARRON_SHAPE_PATH")) if _read_env("ZOHO_ARRON_SHAPE_PATH") else None,
-        help="Optional arrondissement shapefile (.shp) path for borough-level results such as Montreal arrondissements.",
-    )
-    region_parser.add_argument(
-        "--arron-name-attribute",
-        default=_read_env("ZOHO_ARRON_NAME_ATTRIBUTE", default="ARS_NM_ARR"),
-        help="Arrondissement shapefile attribute that contains the arrondissement name.",
-    )
-    region_parser.add_argument(
-        "--muni-shape-path",
-        type=Path,
-        default=Path(_read_env("ZOHO_MUNI_SHAPE_PATH")) if _read_env("ZOHO_MUNI_SHAPE_PATH") else None,
-        help="Primary municipality shapefile (.shp) path.",
-    )
-    region_parser.add_argument(
-        "--muni-name-attribute",
-        default=_read_env("ZOHO_MUNI_NAME_ATTRIBUTE", default="MUS_NM_MUN"),
-        help="Municipality shapefile attribute that contains the municipality name.",
-    )
-    region_parser.add_argument(
-        "--muni-mrc-attribute",
-        default=_read_env("ZOHO_MUNI_MRC_ATTRIBUTE", default="MUS_NM_MRC"),
-        help="Municipality shapefile attribute that contains the MRC name.",
-    )
-    region_parser.add_argument(
-        "--muni-region-attribute",
-        default=_read_env("ZOHO_MUNI_REGION_ATTRIBUTE", default="MUS_NM_REG"),
-        help="Municipality shapefile attribute that contains the region name.",
-    )
-    region_parser.add_argument(
-        "--muni-region-code-attribute",
-        default=_read_env("ZOHO_MUNI_REGION_CODE_ATTRIBUTE", default="MUS_CO_REG"),
-        help="Municipality shapefile attribute that contains the region code.",
-    )
-    region_parser.add_argument(
-        "--mrc-shape-path",
-        type=Path,
-        default=Path(_read_env("ZOHO_MRC_SHAPE_PATH", "ZOHO_REGION_FALLBACK_SHAPE_PATH"))
-        if _read_env("ZOHO_MRC_SHAPE_PATH", "ZOHO_REGION_FALLBACK_SHAPE_PATH")
-        else None,
-        help="Fallback MRC shapefile (.shp) path.",
-    )
-    region_parser.add_argument(
-        "--mrc-name-attribute",
-        default=_read_env("ZOHO_MRC_NAME_ATTRIBUTE", default="MRS_NM_MRC"),
-        help="MRC shapefile attribute that contains the MRC name.",
-    )
-    region_parser.add_argument(
-        "--mrc-region-attribute",
-        default=_read_env("ZOHO_MRC_REGION_ATTRIBUTE", "ZOHO_REGION_FALLBACK_NAME_ATTRIBUTE", default="MRS_NM_REG"),
-        help="MRC shapefile attribute that contains the region name.",
-    )
-    region_parser.add_argument(
-        "--mrc-region-code-attribute",
-        default=_read_env("ZOHO_MRC_REGION_CODE_ATTRIBUTE", "ZOHO_REGION_FALLBACK_CODE_ATTRIBUTE", default="MRS_CO_REG"),
-        help="MRC shapefile attribute that contains the region code.",
-    )
-    region_parser.add_argument(
-        "--shape-path",
-        type=Path,
-        default=Path(_read_env("ZOHO_REGION_SHAPE_PATH")) if _read_env("ZOHO_REGION_SHAPE_PATH") else None,
-        help="Final region fallback shapefile (.shp) path.",
-    )
-    region_parser.add_argument(
-        "--shape-name-attribute",
-        default=_read_env("ZOHO_REGION_NAME_ATTRIBUTE", default="RES_NM_REG"),
-        help="Region shapefile attribute that contains the region name.",
-    )
-    region_parser.add_argument(
-        "--shape-code-attribute",
-        default=_read_env("ZOHO_REGION_CODE_ATTRIBUTE", default="RES_CO_REG"),
-        help="Region shapefile attribute that contains the region code.",
-    )
-    region_parser.add_argument(
-        "--fallback-shape-path",
-        type=Path,
-        default=Path(_read_env("ZOHO_REGION_FALLBACK_SHAPE_PATH")) if _read_env("ZOHO_REGION_FALLBACK_SHAPE_PATH") else None,
-        help="Deprecated alias for --mrc-shape-path.",
-    )
-    region_parser.add_argument(
-        "--fallback-shape-name-attribute",
-        default=_read_env("ZOHO_REGION_FALLBACK_NAME_ATTRIBUTE", default=""),
-        help="Deprecated alias for --mrc-region-attribute.",
-    )
-    region_parser.add_argument(
-        "--fallback-shape-code-attribute",
-        default=_read_env("ZOHO_REGION_FALLBACK_CODE_ATTRIBUTE", default=""),
-        help="Deprecated alias for --mrc-region-code-attribute.",
-    )
+    for boundary_parser in (run_parser, region_parser):
+        boundary_parser.add_argument(
+            "--region-name-field",
+            default=_read_env("ZOHO_QUOTE_REGION_NAME_FIELD"),
+            help="Zoho quote field API name to update with the matched region name.",
+        )
+        boundary_parser.add_argument(
+            "--region-code-field",
+            default=_read_env("ZOHO_QUOTE_REGION_CODE_FIELD"),
+            help="Zoho quote field API name to update with the matched region code.",
+        )
+        boundary_parser.add_argument(
+            "--mrc-name-field",
+            default=_read_env("ZOHO_QUOTE_MRC_NAME_FIELD"),
+            help="Zoho quote field API name to update with the matched MRC name.",
+        )
+        boundary_parser.add_argument(
+            "--muni-name-field",
+            default=_read_env("ZOHO_QUOTE_MUNI_NAME_FIELD"),
+            help="Zoho quote field API name to update with the matched municipality name.",
+        )
+        boundary_parser.add_argument(
+            "--arron-name-field",
+            default=_read_env("ZOHO_QUOTE_ARRON_NAME_FIELD"),
+            help="Zoho quote field API name to update with the matched arrondissement name.",
+        )
+        boundary_parser.add_argument(
+            "--arron-shape-path",
+            type=Path,
+            default=Path(_read_env("ZOHO_ARRON_SHAPE_PATH")) if _read_env("ZOHO_ARRON_SHAPE_PATH") else None,
+            help="Optional arrondissement shapefile (.shp) path for borough-level results such as Montreal arrondissements.",
+        )
+        boundary_parser.add_argument(
+            "--arron-name-attribute",
+            default=_read_env("ZOHO_ARRON_NAME_ATTRIBUTE", default="ARS_NM_ARR"),
+            help="Arrondissement shapefile attribute that contains the arrondissement name.",
+        )
+        boundary_parser.add_argument(
+            "--muni-shape-path",
+            type=Path,
+            default=Path(_read_env("ZOHO_MUNI_SHAPE_PATH")) if _read_env("ZOHO_MUNI_SHAPE_PATH") else None,
+            help="Primary municipality shapefile (.shp) path.",
+        )
+        boundary_parser.add_argument(
+            "--muni-name-attribute",
+            default=_read_env("ZOHO_MUNI_NAME_ATTRIBUTE", default="MUS_NM_MUN"),
+            help="Municipality shapefile attribute that contains the municipality name.",
+        )
+        boundary_parser.add_argument(
+            "--muni-mrc-attribute",
+            default=_read_env("ZOHO_MUNI_MRC_ATTRIBUTE", default="MUS_NM_MRC"),
+            help="Municipality shapefile attribute that contains the MRC name.",
+        )
+        boundary_parser.add_argument(
+            "--muni-region-attribute",
+            default=_read_env("ZOHO_MUNI_REGION_ATTRIBUTE", default="MUS_NM_REG"),
+            help="Municipality shapefile attribute that contains the region name.",
+        )
+        boundary_parser.add_argument(
+            "--muni-region-code-attribute",
+            default=_read_env("ZOHO_MUNI_REGION_CODE_ATTRIBUTE", default="MUS_CO_REG"),
+            help="Municipality shapefile attribute that contains the region code.",
+        )
+        boundary_parser.add_argument(
+            "--mrc-shape-path",
+            type=Path,
+            default=Path(_read_env("ZOHO_MRC_SHAPE_PATH", "ZOHO_REGION_FALLBACK_SHAPE_PATH"))
+            if _read_env("ZOHO_MRC_SHAPE_PATH", "ZOHO_REGION_FALLBACK_SHAPE_PATH")
+            else None,
+            help="Fallback MRC shapefile (.shp) path.",
+        )
+        boundary_parser.add_argument(
+            "--mrc-name-attribute",
+            default=_read_env("ZOHO_MRC_NAME_ATTRIBUTE", default="MRS_NM_MRC"),
+            help="MRC shapefile attribute that contains the MRC name.",
+        )
+        boundary_parser.add_argument(
+            "--mrc-region-attribute",
+            default=_read_env("ZOHO_MRC_REGION_ATTRIBUTE", "ZOHO_REGION_FALLBACK_NAME_ATTRIBUTE", default="MRS_NM_REG"),
+            help="MRC shapefile attribute that contains the region name.",
+        )
+        boundary_parser.add_argument(
+            "--mrc-region-code-attribute",
+            default=_read_env("ZOHO_MRC_REGION_CODE_ATTRIBUTE", "ZOHO_REGION_FALLBACK_CODE_ATTRIBUTE", default="MRS_CO_REG"),
+            help="MRC shapefile attribute that contains the region code.",
+        )
+        boundary_parser.add_argument(
+            "--shape-path",
+            type=Path,
+            default=Path(_read_env("ZOHO_REGION_SHAPE_PATH")) if _read_env("ZOHO_REGION_SHAPE_PATH") else None,
+            help="Final region fallback shapefile (.shp) path.",
+        )
+        boundary_parser.add_argument(
+            "--shape-name-attribute",
+            default=_read_env("ZOHO_REGION_NAME_ATTRIBUTE", default="RES_NM_REG"),
+            help="Region shapefile attribute that contains the region name.",
+        )
+        boundary_parser.add_argument(
+            "--shape-code-attribute",
+            default=_read_env("ZOHO_REGION_CODE_ATTRIBUTE", default="RES_CO_REG"),
+            help="Region shapefile attribute that contains the region code.",
+        )
+        boundary_parser.add_argument(
+            "--fallback-shape-path",
+            type=Path,
+            default=Path(_read_env("ZOHO_REGION_FALLBACK_SHAPE_PATH")) if _read_env("ZOHO_REGION_FALLBACK_SHAPE_PATH") else None,
+            help="Deprecated alias for --mrc-shape-path.",
+        )
+        boundary_parser.add_argument(
+            "--fallback-shape-name-attribute",
+            default=_read_env("ZOHO_REGION_FALLBACK_NAME_ATTRIBUTE", default=""),
+            help="Deprecated alias for --mrc-region-attribute.",
+        )
+        boundary_parser.add_argument(
+            "--fallback-shape-code-attribute",
+            default=_read_env("ZOHO_REGION_FALLBACK_CODE_ATTRIBUTE", default=""),
+            help="Deprecated alias for --mrc-region-code-attribute.",
+        )
+        boundary_parser.add_argument(
+            "--update-existing-region",
+            action="store_true",
+            help="Update Region, MRC, Muni, and Arrondissement fields even when the quote already has values.",
+        )
+
     region_parser.add_argument(
         "--failure-report",
         type=Path,
         default=Path(_read_env("ZOHO_REGION_FAILURE_REPORT_PATH", default="quote-region-failures.xlsx") or "quote-region-failures.xlsx"),
         help="Excel report path for quotes with missing coordinates, partial boundary matches, or failed region updates.",
     )
-    region_parser.add_argument(
-        "--update-existing-region",
-        action="store_true",
-        help="Update Region, MRC, Muni, and Arrondissement fields even when the quote already has values.",
+
+    run_parser.add_argument(
+        "--report-output",
+        type=Path,
+        default=Path(_read_env("ZOHO_QUOTE_RUN_REPORT_PATH", default="quote-run-report.xlsx") or "quote-run-report.xlsx"),
+        help="Path to the consolidated Excel report written by the run command.",
     )
 
     report_parser.add_argument(
@@ -2304,6 +2460,33 @@ def main(argv: list[str] | None = None) -> int:
                         skip_existing=not args.update_existing,
                         dry_run=args.dry_run,
                     )
+            elif args.command == "run":
+                if not args.google_api_key:
+                    raise ConfigError(
+                        "Google API key is required for run mode. Set GOOGLE_MAPS_API_KEY or pass --google-api-key."
+                    )
+
+                region_configs = _build_region_lookup_configs(args)
+                arrond_config = _build_arrond_lookup_config(args)
+                with GoogleGeocoder(
+                    api_key=args.google_api_key,
+                    logger=logger,
+                    timeout_seconds=args.timeout,
+                    max_retries=args.max_retries,
+                    retry_delay_seconds=args.retry_delay,
+                ) as geocoder:
+                    with ExitStack() as stack:
+                        resolvers = [stack.enter_context(RegionShapeResolver(config, logger)) for config in region_configs]
+                        arrond_resolver = stack.enter_context(RegionShapeResolver(arrond_config, logger)) if arrond_config else None
+                        payload = run_quote_enrichment(
+                            zoho_client,
+                            geocoder,
+                            resolvers,
+                            arrond_resolver=arrond_resolver,
+                            max_records=args.max_records,
+                            skip_existing=not args.update_existing,
+                            update_existing_region=args.update_existing_region,
+                        )
             else:
                 region_configs = _build_region_lookup_configs(args)
                 arrond_config = _build_arrond_lookup_config(args)
@@ -2322,14 +2505,42 @@ def main(argv: list[str] | None = None) -> int:
         logger.error(str(exc))
         return 1
 
-    payload["meta"] = {
-        "app_name": APP_NAME,
-        "app_version": APP_VERSION,
-        "command": args.command,
-        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "module": args.module,
-        "max_records": args.max_records,
-    }
+    meta = payload.get("meta") or {}
+    meta.update(
+        {
+            "app_name": APP_NAME,
+            "app_version": APP_VERSION,
+            "command": args.command,
+            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "module": args.module,
+            "max_records": args.max_records,
+        }
+    )
+    payload["meta"] = meta
+
+    if args.command == "run":
+        try:
+            report_path = _write_run_report(args.report_output, payload, logger)
+        except ConfigError as exc:
+            logger.error(str(exc))
+            return 1
+        payload["report_output_path"] = str(report_path)
+        if args.output:
+            _write_json(args.output, payload)
+            logger.info("Wrote JSON output to %s", args.output)
+        for line in payload.get("summary_lines") or []:
+            logger.info(line)
+
+        sync_summary = ((payload.get("source_payloads") or {}).get("sync") or {}).get("summary") or {}
+        region_summary = ((payload.get("source_payloads") or {}).get("region_sync") or {}).get("summary") or {}
+        if (
+            sync_summary.get("geocode_errors", 0)
+            or sync_summary.get("update_errors", 0)
+            or region_summary.get("region_lookup_errors", 0)
+            or region_summary.get("update_errors", 0)
+        ):
+            return 1
+        return 0
 
     if args.command in {"sync", "region-sync"} and args.failure_report:
         try:

@@ -2,16 +2,23 @@
 
 Standalone Python utility for Zoho CRM quote geolocation and boundary enrichment.
 
-It supports two main jobs:
+The simplest path is now one command:
 
-1. fetch quote shipping addresses from Zoho CRM, geocode them with Google, and write latitude/longitude back to the quote
-2. use existing quote latitude/longitude values with shapefiles to resolve and update `Region`, `MRC`, `Muni`, and optionally `Arrondissement`
+1. `run`: fetch one quote set, geocode shipping addresses, update `Lat`/`Long`, resolve `Region`/`MRC`/`Muni`/`Arrondissement`, and write one consolidated Excel report
+
+It still also supports the lower-level jobs:
+
+1. fetch quote shipping addresses from Zoho CRM
+2. geocode and update latitude/longitude only
+3. use existing quote latitude/longitude values with shapefiles to resolve and update `Region`, `MRC`, `Muni`, and optionally `Arrondissement`
+4. merge separate JSON outputs into one readable report
 
 ## What Each File Does
 
 - `zoho_quote_geocode.py`
   Main application. Commands:
   - `fetch`: export quote IDs and shipping address fields
+  - `run`: do the full end-to-end quote enrichment in one command and write one consolidated workbook
   - `sync`: geocode shipping addresses and update quote latitude/longitude
   - `region-sync`: resolve arrondissement, municipality, MRC, and region from shapefiles and update CRM fields
   - `report`: merge `sync` and `region-sync` JSON outputs into one readable Excel run report
@@ -135,6 +142,9 @@ These variables are the Zoho auth and connection settings:
 
 - `ZOHO_GOOGLE_ERROR_REPORT_PATH`
   Default Excel output path for quotes where Google returned `ZERO_RESULTS` or an API error.
+
+- `ZOHO_QUOTE_RUN_REPORT_PATH`
+  Default Excel output path for the one-command `run` workbook.
 
 ## Where To Change Zoho Field Names
 
@@ -272,6 +282,41 @@ ZOHO_REGION_SHAPE_PATH=/opt/update-quote-geolocation/shapes/SHP/regio_s.shp
 
 ## Commands
 
+Run the full process in one command and produce one workbook:
+
+```bash
+update-quote-geolocation run --report-output quote-run-report.xlsx
+```
+
+Run a live 5-record end-to-end test and also keep the merged JSON:
+
+```bash
+update-quote-geolocation run \
+  --max-records 5 \
+  --report-output live-5-run-report.xlsx \
+  --output live-5-run-report.json
+```
+
+If you want to overwrite already-populated `Lat`/`Long`, add:
+
+```bash
+update-quote-geolocation run \
+  --max-records 5 \
+  --update-existing \
+  --report-output live-5-run-report.xlsx
+```
+
+If you want to overwrite already-populated `Region`, `MRC`, `Muni`, or `Arrondissement`, add:
+
+```bash
+update-quote-geolocation run \
+  --max-records 5 \
+  --update-existing-region \
+  --report-output live-5-run-report.xlsx
+```
+
+The remaining commands are still available for debugging or partial reruns.
+
 Fetch quotes and shipping address fields:
 
 ```bash
@@ -290,7 +335,7 @@ Run the live lat/long update:
 update-quote-geolocation sync --output geocode-sync.json
 ```
 
-Run a live 5-record geocode test:
+Run a live 5-record geocode-only test:
 
 ```bash
 update-quote-geolocation sync \
@@ -299,7 +344,7 @@ update-quote-geolocation sync \
   --failure-report live-5-sync-failures.xlsx
 ```
 
-Run a live 5-record boundary update test for `Region`, `MRC`, `Muni`, and optionally `Arrondissement`:
+Run a live 5-record boundary-only update test for `Region`, `MRC`, `Muni`, and optionally `Arrondissement`:
 
 ```bash
 update-quote-geolocation region-sync \
@@ -343,7 +388,7 @@ update-quote-geolocation report \
 - `ZERO_RESULTS`
 - Google API errors
 
-If you want one readable file instead of separate JSON and Excel outputs, use `report`. It creates:
+If you want one readable file instead of separate JSON and Excel outputs, use `run` when you want to process live quotes in one pass, or use `report` when you already have separate `sync` and `region-sync` JSON outputs. The consolidated workbook creates:
 
 - a summary sheet with narrative explanations
 - a quote-by-quote sheet covering both sync steps
@@ -386,7 +431,8 @@ The JSON output now includes:
 - Quotes with existing latitude and longitude are skipped in `sync` unless you pass `--update-existing`.
 - Quotes with all requested Region, MRC, Muni, and Arrondissement fields already filled are skipped in `region-sync` unless you pass `--update-existing-region`.
 - `sync` now logs one line per quote explaining whether it was updated, skipped, or failed.
-- `report` is the best file to review when you want one readable explanation of the whole run instead of separate logs.
+- `run` is the recommended command when you want one live pass and one readable workbook.
+- `report` is the best file to review when you already have separate JSON logs and want one readable explanation of the whole run.
 - With refresh-token auth, the script uses Zoho's returned `api_domain` automatically.
 - Coordinate values are rounded before update so they fit Zoho decimal field limits more reliably.
 - The public APT source is published from the `gh-pages` branch and consumed through `raw.githubusercontent.com`.
