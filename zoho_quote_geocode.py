@@ -109,6 +109,10 @@ def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def _json_string(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False) if value is not None else ""
+
+
 @dataclass(slots=True)
 class ZohoAuthConfig:
     api_base_url: str
@@ -202,10 +206,29 @@ class QuoteAddressRecord:
     def has_coordinates(self) -> bool:
         return self.current_latitude is not None and self.current_longitude is not None
 
+    def missing_shipping_fields(self, fields: "QuoteFieldConfig") -> list[str]:
+        missing: list[str] = []
+        candidates = [
+            (fields.street_field, self.shipping_street),
+            (fields.city_field, self.shipping_city),
+            (fields.state_field, self.shipping_state),
+            (fields.postal_code_field, self.shipping_postal_code),
+            (fields.country_field, self.shipping_country),
+        ]
+        for field_name, value in candidates:
+            if not value:
+                missing.append(field_name)
+        return missing
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "quote_id": self.quote_id,
             "formatted_address": self.formatted_address(),
+            "shipping_street": self.shipping_street,
+            "shipping_city": self.shipping_city,
+            "shipping_state": self.shipping_state,
+            "shipping_postal_code": self.shipping_postal_code,
+            "shipping_country": self.shipping_country,
             "current_latitude": self.current_latitude,
             "current_longitude": self.current_longitude,
             "address_fields": self.address_fields,
@@ -449,16 +472,124 @@ def fetch_quote_shipping_addresses(
     return zoho_client.fetch_quotes_with_shipping_addresses(max_records=max_records)
 
 
+def _build_record_item(record: QuoteAddressRecord, fields: QuoteFieldConfig) -> dict[str, Any]:
+    item = record.to_dict()
+    missing_fields = record.missing_shipping_fields(fields)
+    item["missing_shipping_fields"] = missing_fields
+    item["has_missing_shipping_fields"] = bool(missing_fields)
+    return item
+
+
+def _should_include_in_failure_report(item: dict[str, Any]) -> bool:
+    if item.get("missing_shipping_fields"):
+        return True
+    return item.get("status") in {
+        "skipped_missing_address",
+        "no_geocode_result",
+        "geocode_error",
+        "update_error",
+    }
+
+
+def _write_failure_report(path: Path, payload: dict[str, Any], logger: logging.Logger) -> tuple[Path, int]:
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+    except ImportError as exc:  # pragma: no cover - dependency should be installed by package
+        raise ConfigError(
+            "openpyxl is required to create the Excel failure report. "
+            "Install dependencies again or upgrade the package."
+        ) from exc
+
+    issue_rows = [item for item in payload.get("items", []) if _should_include_in_failure_report(item)]
+    workbook = Workbook()
+
+    summary_sheet = workbook.active
+    summary_sheet.title = "summary"
+    summary_sheet.append(["metric", "value"])
+    for cell in summary_sheet[1]:
+        cell.font = Font(bold=True)
+    for key, value in (payload.get("summary") or {}).items():
+        summary_sheet.append([key, value])
+    summary_sheet.append(["issue_rows", len(issue_rows)])
+    summary_sheet.freeze_panes = "A2"
+
+    issues_sheet = workbook.create_sheet("issues")
+    headers = [
+        "quote_id",
+        "status",
+        "missing_shipping_fields",
+        "formatted_address",
+        "shipping_street",
+        "shipping_city",
+        "shipping_state",
+        "shipping_postal_code",
+        "shipping_country",
+        "current_latitude",
+        "current_longitude",
+        "geocoded_latitude",
+        "geocoded_longitude",
+        "geocoded_formatted_address",
+        "geocode_place_id",
+        "geocode_location_type",
+        "error",
+        "raw_address_fields",
+        "update_response",
+    ]
+    issues_sheet.append(headers)
+    for cell in issues_sheet[1]:
+        cell.font = Font(bold=True)
+
+    for item in issue_rows:
+        geocode = item.get("geocode") or {}
+        issues_sheet.append(
+            [
+                item.get("quote_id", ""),
+                item.get("status", ""),
+                ", ".join(item.get("missing_shipping_fields") or []),
+                item.get("formatted_address", ""),
+                item.get("shipping_street", ""),
+                item.get("shipping_city", ""),
+                item.get("shipping_state", ""),
+                item.get("shipping_postal_code", ""),
+                item.get("shipping_country", ""),
+                item.get("current_latitude", ""),
+                item.get("current_longitude", ""),
+                geocode.get("latitude", ""),
+                geocode.get("longitude", ""),
+                geocode.get("formatted_address", ""),
+                geocode.get("place_id", ""),
+                geocode.get("location_type", ""),
+                item.get("error", ""),
+                _json_string(item.get("address_fields")),
+                _json_string(item.get("update_response")),
+            ]
+        )
+
+    for sheet in (summary_sheet, issues_sheet):
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        for column_cells in sheet.columns:
+            width = max(len(str(cell.value or "")) for cell in column_cells)
+            sheet.column_dimensions[column_cells[0].column_letter].width = min(max(width + 2, 12), 48)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(path)
+    logger.info("Wrote Excel failure report to %s with %s issue rows", path, len(issue_rows))
+    return path, len(issue_rows)
+
+
 def geocode_quote_records(
     records: Iterable[QuoteAddressRecord],
     geocoder: GoogleGeocoder,
     *,
+    field_config: QuoteFieldConfig,
     skip_existing: bool = True,
 ) -> list[dict[str, Any]]:
     report: list[dict[str, Any]] = []
 
     for record in records:
-        item = record.to_dict()
+        item = _build_record_item(record, field_config)
         address = record.formatted_address()
 
         if not address:
@@ -506,7 +637,7 @@ def sync_quote_coordinates(
     items: list[dict[str, Any]] = []
 
     for record in records:
-        item = record.to_dict()
+        item = _build_record_item(record, zoho_client.field_config)
         address = record.formatted_address()
 
         if not address:
@@ -691,6 +822,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=int(_read_env("GOOGLE_GEOCODE_MAX_RETRIES", default="3") or "3"),
         help="Maximum Google Geocoding retry attempts.",
     )
+    sync_parser.add_argument(
+        "--failure-report",
+        type=Path,
+        default=Path(_read_env("ZOHO_QUOTE_FAILURE_REPORT_PATH", default="quote-geolocation-failures.xlsx") or "quote-geolocation-failures.xlsx"),
+        help="Excel report path for quotes with missing shipping fields or failed updates.",
+    )
 
     return parser
 
@@ -766,6 +903,15 @@ def main(argv: list[str] | None = None) -> int:
     except (ConfigError, ZohoApiError, GoogleGeocodeError) as exc:
         logger.error(str(exc))
         return 1
+
+    if args.command == "sync" and args.failure_report:
+        try:
+            report_path, issue_count = _write_failure_report(args.failure_report, payload, logger)
+        except ConfigError as exc:
+            logger.error(str(exc))
+            return 1
+        payload["failure_report_path"] = str(report_path)
+        payload["failure_report_issue_count"] = issue_count
 
     if args.output:
         _write_json(args.output, payload)

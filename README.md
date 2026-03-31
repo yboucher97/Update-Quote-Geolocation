@@ -28,7 +28,7 @@ It fetches quotes from Zoho CRM, builds a list of quote IDs plus shipping addres
   Builds the `.deb` package.
 
 - `packaging/build-apt-repo.sh`
-  Creates the APT repository structure, package index, Release file, and install helper files for GitHub Pages.
+  Creates the APT repository structure, package index, Release file, and install helper files for the published `gh-pages` branch.
 
 - `.github/workflows/publish-apt.yml`
   On every push to `main`, builds a new package version and republishes the APT repository to GitHub Pages.
@@ -156,6 +156,9 @@ Set these values there:
 - `GOOGLE_MAPS_API_KEY`
   Google Geocoding API key.
 
+- `ZOHO_QUOTE_FAILURE_REPORT_PATH`
+  Default Excel output path for quotes that had missing shipping fields or failed during geocoding/update.
+
 ## Where to change field mappings
 
 Change these in the same env file:
@@ -191,6 +194,14 @@ Run the full update:
 update-quote-geolocation sync --output geocode-sync.json
 ```
 
+Write the exception Excel file somewhere explicit:
+
+```bash
+update-quote-geolocation sync \
+  --output geocode-sync.json \
+  --failure-report quote-geolocation-failures.xlsx
+```
+
 Limit records while testing:
 
 ```bash
@@ -201,6 +212,44 @@ Show installed version:
 
 ```bash
 update-quote-geolocation --version
+```
+
+## Excel exception report
+
+Every `sync` run writes an Excel report by default. The default filename is:
+
+```text
+quote-geolocation-failures.xlsx
+```
+
+The report includes one row per quote when either of these is true:
+
+- one or more shipping fields are empty
+- the quote failed during geocoding or CRM update
+
+The row includes:
+
+- quote ID
+- sync status
+- missing shipping field names
+- formatted address
+- individual shipping fields
+- current latitude/longitude
+- geocoded latitude/longitude
+- geocoded formatted address
+- any error message
+- raw address fields
+- update response payload
+
+## Live 5-record test
+
+To test on 5 live quotes and actually update them:
+
+```bash
+update-quote-geolocation sync \
+  --max-records 5 \
+  --output live-5-sync.json \
+  --failure-report live-5-sync-failures.xlsx
 ```
 
 ## Notes
