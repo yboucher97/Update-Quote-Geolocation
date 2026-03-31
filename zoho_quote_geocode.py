@@ -836,10 +836,6 @@ def _merge_boundary_matches(
 def _should_include_in_failure_report(item: dict[str, Any]) -> bool:
     if item.get("missing_shipping_fields"):
         return True
-    if item.get("missing_coordinate_fields"):
-        return True
-    if item.get("missing_admin_fields"):
-        return True
     return item.get("status") in {
         "skipped_missing_address",
         "skipped_missing_coordinates",
@@ -848,6 +844,7 @@ def _should_include_in_failure_report(item: dict[str, Any]) -> bool:
         "region_lookup_error",
         "no_region_match",
         "no_admin_update_values",
+        "updated_partial",
         "update_error",
     }
 
@@ -1050,6 +1047,402 @@ def _write_google_error_report(path: Path, payload: dict[str, Any], logger: logg
     workbook.save(path)
     logger.info("Wrote Google geocode error report to %s with %s issue rows", path, len(issue_rows))
     return path, len(issue_rows)
+
+
+def _load_json_payload(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ConfigError(f"JSON input file was not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"JSON input file is not valid JSON: {path}") from exc
+
+
+def _ordered_quote_ids(*payloads: dict[str, Any] | None) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for payload in payloads:
+        for item in payload.get("items", []) if payload else []:
+            quote_id = str(item.get("quote_id") or "")
+            if quote_id and quote_id not in seen:
+                seen.add(quote_id)
+                ordered.append(quote_id)
+    return ordered
+
+
+def _compact_statuses(items: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for item in items:
+        status = item.get("status")
+        quote_id = item.get("quote_id")
+        if status and quote_id:
+            parts.append(f"{quote_id} ({status})")
+    return ", ".join(parts)
+
+
+def _build_run_report(
+    *,
+    sync_payload: dict[str, Any] | None,
+    region_payload: dict[str, Any] | None,
+    sync_input_path: Path | None = None,
+    region_input_path: Path | None = None,
+) -> dict[str, Any]:
+    sync_items = {
+        str(item.get("quote_id")): item
+        for item in (sync_payload or {}).get("items", [])
+        if item.get("quote_id")
+    }
+    region_items = {
+        str(item.get("quote_id")): item
+        for item in (region_payload or {}).get("items", [])
+        if item.get("quote_id")
+    }
+
+    summary: dict[str, Any] = {}
+    if sync_payload:
+        for key, value in (sync_payload.get("summary") or {}).items():
+            summary[f"sync_{key}"] = value
+    if region_payload:
+        for key, value in (region_payload.get("summary") or {}).items():
+            summary[f"region_{key}"] = value
+
+    quote_rows: list[dict[str, Any]] = []
+    issue_rows: list[dict[str, Any]] = []
+    quote_ids = _ordered_quote_ids(sync_payload, region_payload)
+
+    for quote_id in quote_ids:
+        sync_item = sync_items.get(quote_id) or {}
+        region_item = region_items.get(quote_id) or {}
+        base_item = region_item or sync_item
+
+        row = {
+            "quote_id": quote_id,
+            "formatted_address": base_item.get("formatted_address") or sync_item.get("formatted_address"),
+            "shipping_street": base_item.get("shipping_street") or sync_item.get("shipping_street"),
+            "shipping_city": base_item.get("shipping_city") or sync_item.get("shipping_city"),
+            "shipping_state": base_item.get("shipping_state") or sync_item.get("shipping_state"),
+            "shipping_postal_code": base_item.get("shipping_postal_code") or sync_item.get("shipping_postal_code"),
+            "shipping_country": base_item.get("shipping_country") or sync_item.get("shipping_country"),
+            "sync_status": sync_item.get("status"),
+            "sync_status_reason": sync_item.get("status_reason"),
+            "google_status": sync_item.get("google_status"),
+            "geocode_request_address": sync_item.get("geocode_request_address"),
+            "start_latitude": sync_item.get("current_latitude"),
+            "start_longitude": sync_item.get("current_longitude"),
+            "geocoded_latitude": (sync_item.get("geocode") or {}).get("latitude"),
+            "geocoded_longitude": (sync_item.get("geocode") or {}).get("longitude"),
+            "coordinate_update_values": sync_item.get("coordinate_update_values"),
+            "sync_error": sync_item.get("error"),
+            "region_status": region_item.get("status"),
+            "region_status_reason": region_item.get("status_reason"),
+            "region_match_source": region_item.get("region_match_source"),
+            "arrond_match_source": region_item.get("arrond_match_source"),
+            "region_start_latitude": region_item.get("current_latitude"),
+            "region_start_longitude": region_item.get("current_longitude"),
+            "current_region_name": region_item.get("current_region_name"),
+            "current_region_code": region_item.get("current_region_code"),
+            "current_mrc_name": region_item.get("current_mrc_name"),
+            "current_muni_name": region_item.get("current_muni_name"),
+            "current_arrond_name": region_item.get("current_arrond_name"),
+            "resolved_region_name": region_item.get("resolved_region_name"),
+            "resolved_region_code": region_item.get("resolved_region_code"),
+            "resolved_mrc_name": region_item.get("resolved_mrc_name"),
+            "resolved_muni_name": region_item.get("resolved_muni_name"),
+            "resolved_arrond_name": region_item.get("resolved_arrond_name"),
+            "admin_update_values": region_item.get("admin_update_values"),
+            "region_error": region_item.get("error"),
+            "sync_started_missing_shipping_fields": sync_item.get("missing_shipping_fields") or region_item.get("missing_shipping_fields") or [],
+            "sync_started_missing_coordinate_fields": sync_item.get("missing_coordinate_fields") or [],
+            "remaining_admin_fields_after_region": region_item.get("missing_admin_fields") or [],
+        }
+
+        if row["sync_status"] in {"skipped_missing_address", "no_geocode_result", "geocode_error", "update_error"}:
+            row["overall_outcome"] = "sync_issue"
+        elif row["region_status"] in {"region_lookup_error", "no_region_match", "update_error"}:
+            row["overall_outcome"] = "region_issue"
+        elif row["region_status"] in {"updated_partial", "no_admin_update_values"}:
+            row["overall_outcome"] = "partial_boundary"
+        elif row["sync_status"] == "skipped_existing_coordinates":
+            row["overall_outcome"] = "used_existing_coordinates"
+        else:
+            row["overall_outcome"] = "ok"
+
+        quote_rows.append(row)
+        if row["overall_outcome"] != "ok":
+            issue_rows.append(row)
+
+    summary_lines: list[str] = []
+    if sync_payload:
+        sync_summary = sync_payload.get("summary") or {}
+        summary_lines.append(
+            "Geocode sync processed "
+            f"{sync_summary.get('fetched', 0)} quotes: "
+            f"{sync_summary.get('updated', 0)} updated, "
+            f"{sync_summary.get('skipped_existing_coordinates', 0)} already had coordinates, "
+            f"{sync_summary.get('skipped_missing_address', 0)} missing addresses, "
+            f"{sync_summary.get('no_geocode_result', 0)} Google zero-results, "
+            f"{sync_summary.get('geocode_errors', 0)} Google API errors, and "
+            f"{sync_summary.get('update_errors', 0)} Zoho coordinate update errors."
+        )
+        sync_blockers = [
+            item
+            for item in (sync_payload.get("items") or [])
+            if item.get("status") in {"skipped_missing_address", "no_geocode_result", "geocode_error", "update_error"}
+        ]
+        if sync_blockers:
+            summary_lines.append("Quotes blocked during geocode sync: " + _compact_statuses(sync_blockers))
+        elif sync_summary.get("updated", 0) or sync_summary.get("skipped_existing_coordinates", 0):
+            summary_lines.append("Google geocoding returned a usable result for every address sent in this run.")
+
+    if region_payload:
+        region_summary = region_payload.get("summary") or {}
+        summary_lines.append(
+            "Boundary sync processed "
+            f"{region_summary.get('fetched', 0)} quotes: "
+            f"{region_summary.get('updated', 0)} full boundary updates, "
+            f"{region_summary.get('updated_partial', 0)} partial updates, "
+            f"{region_summary.get('no_admin_update_values', 0)} no-op updates, "
+            f"{region_summary.get('skipped_missing_coordinates', 0)} skipped for missing coordinates, "
+            f"{region_summary.get('region_lookup_errors', 0)} lookup errors, and "
+            f"{region_summary.get('update_errors', 0)} Zoho boundary update errors."
+        )
+        partial_items = [
+            item
+            for item in (region_payload.get("items") or [])
+            if item.get("status") == "updated_partial"
+        ]
+        if partial_items and all((item.get("missing_admin_fields") or []) == ["Arrondissement"] for item in partial_items):
+            summary_lines.append(
+                f"All {len(partial_items)} partial boundary updates were missing only Arrondissement. "
+                "Region, MRC, and Muni were resolved and written successfully."
+            )
+        region_blockers = [
+            item
+            for item in (region_payload.get("items") or [])
+            if item.get("status") in {"skipped_missing_coordinates", "region_lookup_error", "no_region_match", "update_error", "no_admin_update_values"}
+        ]
+        if region_blockers:
+            summary_lines.append("Quotes requiring review during boundary sync: " + _compact_statuses(region_blockers))
+
+    if sync_payload and region_payload:
+        sync_ids = {str(item.get("quote_id")) for item in (sync_payload.get("items") or []) if item.get("quote_id")}
+        region_ids = {str(item.get("quote_id")) for item in (region_payload.get("items") or []) if item.get("quote_id")}
+        if sync_ids != region_ids:
+            summary_lines.append(
+                "The sync and region-sync inputs do not cover the exact same quote set. "
+                "Compare quote IDs before drawing conclusions across both steps."
+            )
+
+    return {
+        "meta": {
+            "app_name": APP_NAME,
+            "app_version": APP_VERSION,
+            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "sync_input_path": str(sync_input_path) if sync_input_path else None,
+            "region_input_path": str(region_input_path) if region_input_path else None,
+        },
+        "summary": summary,
+        "summary_lines": summary_lines,
+        "quotes": quote_rows,
+        "issues": issue_rows,
+        "source_payloads": {
+            "sync": sync_payload,
+            "region_sync": region_payload,
+        },
+    }
+
+
+def _write_run_report(path: Path, payload: dict[str, Any], logger: logging.Logger) -> Path:
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+    except ImportError as exc:  # pragma: no cover
+        raise ConfigError(
+            "openpyxl is required to create the consolidated Excel run report. "
+            "Install dependencies again or upgrade the package."
+        ) from exc
+
+    workbook = Workbook()
+
+    summary_sheet = workbook.active
+    summary_sheet.title = "summary"
+    summary_sheet.append(["section", "key", "value"])
+    for cell in summary_sheet[1]:
+        cell.font = Font(bold=True)
+
+    for key, value in (payload.get("meta") or {}).items():
+        summary_sheet.append(["meta", key, value])
+
+    for index, line in enumerate(payload.get("summary_lines") or [], start=1):
+        summary_sheet.append(["narrative", f"line_{index}", line])
+
+    for key, value in (payload.get("summary") or {}).items():
+        summary_sheet.append(["metric", key, value])
+
+    quotes_sheet = workbook.create_sheet("quotes")
+    quote_rows = payload.get("quotes") or []
+    quote_headers = [
+        "quote_id",
+        "overall_outcome",
+        "formatted_address",
+        "shipping_street",
+        "shipping_city",
+        "shipping_state",
+        "shipping_postal_code",
+        "shipping_country",
+        "sync_status",
+        "sync_status_reason",
+        "google_status",
+        "geocode_request_address",
+        "start_latitude",
+        "start_longitude",
+        "geocoded_latitude",
+        "geocoded_longitude",
+        "coordinate_update_values",
+        "sync_error",
+        "region_status",
+        "region_status_reason",
+        "region_match_source",
+        "arrond_match_source",
+        "region_start_latitude",
+        "region_start_longitude",
+        "current_region_name",
+        "current_region_code",
+        "current_mrc_name",
+        "current_muni_name",
+        "current_arrond_name",
+        "resolved_region_name",
+        "resolved_region_code",
+        "resolved_mrc_name",
+        "resolved_muni_name",
+        "resolved_arrond_name",
+        "admin_update_values",
+        "region_error",
+            "sync_started_missing_shipping_fields",
+            "sync_started_missing_coordinate_fields",
+            "remaining_admin_fields_after_region",
+        ]
+    quotes_sheet.append(quote_headers)
+    for cell in quotes_sheet[1]:
+        cell.font = Font(bold=True)
+    for row in quote_rows:
+        quotes_sheet.append(
+            [
+                row.get("quote_id", ""),
+                row.get("overall_outcome", ""),
+                row.get("formatted_address", ""),
+                row.get("shipping_street", ""),
+                row.get("shipping_city", ""),
+                row.get("shipping_state", ""),
+                row.get("shipping_postal_code", ""),
+                row.get("shipping_country", ""),
+                row.get("sync_status", ""),
+                row.get("sync_status_reason", ""),
+                row.get("google_status", ""),
+                row.get("geocode_request_address", ""),
+                row.get("start_latitude", ""),
+                row.get("start_longitude", ""),
+                row.get("geocoded_latitude", ""),
+                row.get("geocoded_longitude", ""),
+                _json_string(row.get("coordinate_update_values")),
+                row.get("sync_error", ""),
+                row.get("region_status", ""),
+                row.get("region_status_reason", ""),
+                row.get("region_match_source", ""),
+                row.get("arrond_match_source", ""),
+                row.get("region_start_latitude", ""),
+                row.get("region_start_longitude", ""),
+                row.get("current_region_name", ""),
+                row.get("current_region_code", ""),
+                row.get("current_mrc_name", ""),
+                row.get("current_muni_name", ""),
+                row.get("current_arrond_name", ""),
+                row.get("resolved_region_name", ""),
+                row.get("resolved_region_code", ""),
+                row.get("resolved_mrc_name", ""),
+                row.get("resolved_muni_name", ""),
+                row.get("resolved_arrond_name", ""),
+                _json_string(row.get("admin_update_values")),
+                row.get("region_error", ""),
+                ", ".join(row.get("sync_started_missing_shipping_fields") or []),
+                ", ".join(row.get("sync_started_missing_coordinate_fields") or []),
+                ", ".join(row.get("remaining_admin_fields_after_region") or []),
+            ]
+        )
+
+    issues_sheet = workbook.create_sheet("issues")
+    issues_sheet.append(quote_headers)
+    for cell in issues_sheet[1]:
+        cell.font = Font(bold=True)
+    for row in payload.get("issues") or []:
+        issues_sheet.append(
+            [
+                row.get("quote_id", ""),
+                row.get("overall_outcome", ""),
+                row.get("formatted_address", ""),
+                row.get("shipping_street", ""),
+                row.get("shipping_city", ""),
+                row.get("shipping_state", ""),
+                row.get("shipping_postal_code", ""),
+                row.get("shipping_country", ""),
+                row.get("sync_status", ""),
+                row.get("sync_status_reason", ""),
+                row.get("google_status", ""),
+                row.get("geocode_request_address", ""),
+                row.get("start_latitude", ""),
+                row.get("start_longitude", ""),
+                row.get("geocoded_latitude", ""),
+                row.get("geocoded_longitude", ""),
+                _json_string(row.get("coordinate_update_values")),
+                row.get("sync_error", ""),
+                row.get("region_status", ""),
+                row.get("region_status_reason", ""),
+                row.get("region_match_source", ""),
+                row.get("arrond_match_source", ""),
+                row.get("region_start_latitude", ""),
+                row.get("region_start_longitude", ""),
+                row.get("current_region_name", ""),
+                row.get("current_region_code", ""),
+                row.get("current_mrc_name", ""),
+                row.get("current_muni_name", ""),
+                row.get("current_arrond_name", ""),
+                row.get("resolved_region_name", ""),
+                row.get("resolved_region_code", ""),
+                row.get("resolved_mrc_name", ""),
+                row.get("resolved_muni_name", ""),
+                row.get("resolved_arrond_name", ""),
+                _json_string(row.get("admin_update_values")),
+                row.get("region_error", ""),
+                ", ".join(row.get("sync_started_missing_shipping_fields") or []),
+                ", ".join(row.get("sync_started_missing_coordinate_fields") or []),
+                ", ".join(row.get("remaining_admin_fields_after_region") or []),
+            ]
+        )
+
+    raw_sheet = workbook.create_sheet("raw_json")
+    raw_sheet.append(["source", "line_number", "content"])
+    for cell in raw_sheet[1]:
+        cell.font = Font(bold=True)
+    for source_name, source_payload in (payload.get("source_payloads") or {}).items():
+        if not source_payload:
+            continue
+        for line_number, line in enumerate(
+            json.dumps(source_payload, indent=2, ensure_ascii=False, default=_json_default).splitlines(),
+            start=1,
+        ):
+            raw_sheet.append([source_name, line_number, line])
+
+    for sheet in workbook.worksheets:
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        for column_cells in sheet.columns:
+            width = max(len(str(cell.value or "")) for cell in column_cells)
+            sheet.column_dimensions[column_cells[0].column_letter].width = min(max(width + 2, 12), 60)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(path)
+    logger.info("Wrote consolidated run report to %s", path)
+    return path
 
 
 def geocode_quote_records(
@@ -1441,6 +1834,10 @@ def build_parser() -> argparse.ArgumentParser:
         "region-sync",
         help="Use quote latitude/longitude to resolve arrondissement, municipality, MRC, and region polygons and update quote fields.",
     )
+    report_parser = subparsers.add_parser(
+        "report",
+        help="Combine sync and region-sync JSON outputs into one readable Excel report.",
+    )
 
     for current_parser in (fetch_parser, sync_parser, region_parser):
         current_parser.add_argument(
@@ -1711,6 +2108,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Update Region, MRC, Muni, and Arrondissement fields even when the quote already has values.",
     )
 
+    report_parser.add_argument(
+        "--sync-input",
+        type=Path,
+        default=None,
+        help="Path to a JSON file produced by the sync command.",
+    )
+    report_parser.add_argument(
+        "--region-input",
+        type=Path,
+        default=None,
+        help="Path to a JSON file produced by the region-sync command.",
+    )
+    report_parser.add_argument(
+        "--report-output",
+        type=Path,
+        default=Path("quote-run-report.xlsx"),
+        help="Path to the consolidated Excel report file.",
+    )
+    report_parser.add_argument(
+        "--json-output",
+        type=Path,
+        default=None,
+        help="Optional path to write the merged report payload as JSON.",
+    )
+    report_parser.add_argument(
+        "--log-level",
+        default=os.getenv("LOG_LEVEL", "INFO"),
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Log level.",
+    )
+
     return parser
 
 
@@ -1821,6 +2249,31 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     logger = _configure_logging(args.log_level)
+
+    if args.command == "report":
+        if not args.sync_input and not args.region_input:
+            logger.error("At least one input is required for report mode. Pass --sync-input and/or --region-input.")
+            return 1
+
+        try:
+            sync_payload = _load_json_payload(args.sync_input) if args.sync_input else None
+            region_payload = _load_json_payload(args.region_input) if args.region_input else None
+            payload = _build_run_report(
+                sync_payload=sync_payload,
+                region_payload=region_payload,
+                sync_input_path=args.sync_input,
+                region_input_path=args.region_input,
+            )
+            report_path = _write_run_report(args.report_output, payload, logger)
+            payload["report_output_path"] = str(report_path)
+            if args.json_output:
+                _write_json(args.json_output, payload)
+                logger.info("Wrote merged report JSON to %s", args.json_output)
+            return 0
+        except ConfigError as exc:
+            logger.error(str(exc))
+            return 1
+
     zoho_config, field_config = _build_configs(args)
 
     try:

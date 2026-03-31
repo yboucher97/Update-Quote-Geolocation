@@ -14,6 +14,7 @@ It supports two main jobs:
   - `fetch`: export quote IDs and shipping address fields
   - `sync`: geocode shipping addresses and update quote latitude/longitude
   - `region-sync`: resolve arrondissement, municipality, MRC, and region from shapefiles and update CRM fields
+  - `report`: merge `sync` and `region-sync` JSON outputs into one readable Excel run report
 
 - `zoho_quote_geocode.env.example`
   Template config file. This shows where to put Zoho OAuth details, Google API key, Zoho field API names, and shapefile paths.
@@ -323,6 +324,16 @@ Show the installed version:
 update-quote-geolocation --version
 ```
 
+Build one consolidated report from the `sync` and `region-sync` JSON outputs:
+
+```bash
+update-quote-geolocation report \
+  --sync-input live-5-sync.json \
+  --region-input live-5-region-sync.json \
+  --report-output live-5-run-report.xlsx \
+  --json-output live-5-run-report.json
+```
+
 ## Excel Failure Reports
 
 `sync` writes an Excel report for quotes with missing shipping fields, geocoding failures, or CRM update failures.
@@ -331,6 +342,13 @@ update-quote-geolocation --version
 
 - `ZERO_RESULTS`
 - Google API errors
+
+If you want one readable file instead of separate JSON and Excel outputs, use `report`. It creates:
+
+- a summary sheet with narrative explanations
+- a quote-by-quote sheet covering both sync steps
+- an issues sheet filtered to rows that still need review
+- a raw JSON sheet that embeds the original command outputs
 
 `region-sync` writes an Excel report for quotes when any of these happened:
 
@@ -361,12 +379,14 @@ The JSON output now includes:
 - `status_reason` on each quote item
 - `google_status` on geocode items
 - `coordinate_update_values` or `admin_update_values` when applicable
+- merged `report` JSON when you want both steps in one artifact
 
 ## Notes
 
 - Quotes with existing latitude and longitude are skipped in `sync` unless you pass `--update-existing`.
 - Quotes with all requested Region, MRC, Muni, and Arrondissement fields already filled are skipped in `region-sync` unless you pass `--update-existing-region`.
 - `sync` now logs one line per quote explaining whether it was updated, skipped, or failed.
+- `report` is the best file to review when you want one readable explanation of the whole run instead of separate logs.
 - With refresh-token auth, the script uses Zoho's returned `api_domain` automatically.
 - Coordinate values are rounded before update so they fit Zoho decimal field limits more reliably.
 - The public APT source is published from the `gh-pages` branch and consumed through `raw.githubusercontent.com`.
