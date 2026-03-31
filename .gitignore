@@ -4,3 +4,4 @@ __pycache__/
 zoho_quote_geocode.env
 *.log
 *.json
+dist/

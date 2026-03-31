@@ -1,0 +1,60 @@
+name: Publish APT Repository
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-apt-repo
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      PACKAGE_VERSION: 0.1.${{ github.run_number }}
+      SITE_URL: https://yboucher97.github.io/Update-Quote-Geolocation
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apt-utils dpkg-dev
+
+      - name: Build Debian package
+        run: ./packaging/build-deb.sh "${PACKAGE_VERSION}"
+
+      - name: Build APT repository
+        run: ./packaging/build-apt-repo.sh "${PACKAGE_VERSION}"
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: update-quote-geolocation-deb
+          path: dist/deb/*.deb
+
+      - name: Publish APT repository to gh-pages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          touch dist/apt-repo/.nojekyll
+          cd dist/apt-repo
+          git init -b gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "Publish ${PACKAGE_VERSION}"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force origin gh-pages

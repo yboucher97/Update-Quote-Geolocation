@@ -15,6 +15,15 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+APP_NAME = "update-quote-geolocation"
+APP_VERSION = os.getenv("UPDATE_QUOTE_GEOLOCATION_VERSION", "0.1.0")
+ENV_FILE_ENVVAR = "ZOHO_QUOTE_GEOLOCATION_ENV_FILE"
+DEFAULT_ENV_PATHS = (
+    Path("/etc") / APP_NAME / "zoho_quote_geocode.env",
+    Path.home() / ".config" / APP_NAME / "zoho_quote_geocode.env",
+    Path.cwd() / "zoho_quote_geocode.env",
+)
+
 
 class ConfigError(RuntimeError):
     """Raised when required configuration is missing or invalid."""
@@ -34,6 +43,48 @@ def _read_env(*names: str, default: str | None = None) -> str | None:
         if value:
             return value
     return default
+
+
+def _parse_env_assignment(line: str) -> tuple[str, str] | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return None
+    key, value = stripped.split("=", 1)
+    key = key.strip()
+    value = value.strip()
+    if value and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    if key:
+        return key, value
+    return None
+
+
+def _load_env_file(path: Path) -> bool:
+    if not path.exists():
+        return False
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        parsed = _parse_env_assignment(raw_line)
+        if not parsed:
+            continue
+        key, value = parsed
+        os.environ.setdefault(key, value)
+    return True
+
+
+def _load_default_env_files() -> list[Path]:
+    loaded: list[Path] = []
+    configured_path = _read_env(ENV_FILE_ENVVAR)
+    if configured_path:
+        target = Path(configured_path).expanduser()
+        if _load_env_file(target):
+            loaded.append(target)
+        return loaded
+
+    for path in DEFAULT_ENV_PATHS:
+        if _load_env_file(path):
+            loaded.append(path)
+    return loaded
 
 
 def _clean_text(value: Any) -> str | None:
@@ -521,6 +572,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Fetch Zoho CRM quotes, geocode shipping addresses with Google, and update latitude/longitude."
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     fetch_parser = subparsers.add_parser("fetch", help="Fetch quotes and export their shipping address fields.")
@@ -676,6 +728,7 @@ def _configure_logging(level_name: str) -> logging.Logger:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _load_default_env_files()
     parser = build_parser()
     args = parser.parse_args(argv)
     logger = _configure_logging(args.log_level)
