@@ -177,6 +177,7 @@ class QuoteFieldConfig:
     region_code_field: str | None
     mrc_name_field: str | None
     muni_name_field: str | None
+    arrond_name_field: str | None
     coordinate_decimal_places: int
     coordinate_max_length: int
 
@@ -200,6 +201,8 @@ class QuoteFieldConfig:
             fields.append(self.mrc_name_field)
         if self.muni_name_field:
             fields.append(self.muni_name_field)
+        if self.arrond_name_field:
+            fields.append(self.arrond_name_field)
         seen: set[str] = set()
         ordered: list[str] = []
         for field_name in fields:
@@ -223,6 +226,7 @@ class QuoteAddressRecord:
     current_region_code: str | None
     current_mrc_name: str | None
     current_muni_name: str | None
+    current_arrond_name: str | None
     address_fields: dict[str, Any]
 
     @classmethod
@@ -246,6 +250,8 @@ class QuoteAddressRecord:
             address_fields[fields.mrc_name_field] = record.get(fields.mrc_name_field)
         if fields.muni_name_field:
             address_fields[fields.muni_name_field] = record.get(fields.muni_name_field)
+        if fields.arrond_name_field:
+            address_fields[fields.arrond_name_field] = record.get(fields.arrond_name_field)
 
         return cls(
             quote_id=str(record["id"]),
@@ -260,6 +266,7 @@ class QuoteAddressRecord:
             current_region_code=_clean_text(record.get(fields.region_code_field)) if fields.region_code_field else None,
             current_mrc_name=_clean_text(record.get(fields.mrc_name_field)) if fields.mrc_name_field else None,
             current_muni_name=_clean_text(record.get(fields.muni_name_field)) if fields.muni_name_field else None,
+            current_arrond_name=_clean_text(record.get(fields.arrond_name_field)) if fields.arrond_name_field else None,
             address_fields=address_fields,
         )
 
@@ -303,6 +310,7 @@ class QuoteAddressRecord:
             "current_region_code": self.current_region_code,
             "current_mrc_name": self.current_mrc_name,
             "current_muni_name": self.current_muni_name,
+            "current_arrond_name": self.current_arrond_name,
             "address_fields": self.address_fields,
         }
 
@@ -315,6 +323,7 @@ class RegionLookupConfig:
     region_code_attribute: str | None
     mrc_name_attribute: str | None = None
     muni_name_attribute: str | None = None
+    arrond_name_attribute: str | None = None
 
 
 @dataclass(slots=True)
@@ -324,6 +333,7 @@ class RegionMatch:
     code: str | None
     mrc_name: str | None
     muni_name: str | None
+    arrond_name: str | None
     attributes: dict[str, Any]
 
 
@@ -413,6 +423,7 @@ class RegionShapeResolver:
         self.code_index = self._field_index(config.region_code_attribute) if config.region_code_attribute else None
         self.mrc_index = self._field_index(config.mrc_name_attribute) if config.mrc_name_attribute else None
         self.muni_index = self._field_index(config.muni_name_attribute) if config.muni_name_attribute else None
+        self.arrond_index = self._field_index(config.arrond_name_attribute) if config.arrond_name_attribute else None
         self.records = list(self.reader.iterShapeRecords())
 
     def __enter__(self) -> "RegionShapeResolver":
@@ -454,12 +465,18 @@ class RegionShapeResolver:
                     if self.muni_index is not None
                     else None
                 )
+                arrond_name = (
+                    _clean_text(record_values[self.arrond_index])
+                    if self.arrond_index is not None
+                    else None
+                )
                 return RegionMatch(
                     source_label=self.config.source_label,
                     name=name,
                     code=code,
                     mrc_name=mrc_name,
                     muni_name=muni_name,
+                    arrond_name=arrond_name,
                     attributes=attributes,
                 )
 
@@ -765,6 +782,8 @@ def _admin_target_specs(
         specs.append((fields.mrc_name_field, record.current_mrc_name, match.mrc_name if match else None))
     if fields.muni_name_field:
         specs.append((fields.muni_name_field, record.current_muni_name, match.muni_name if match else None))
+    if fields.arrond_name_field:
+        specs.append((fields.arrond_name_field, record.current_arrond_name, match.arrond_name if match else None))
     return specs
 
 
@@ -780,6 +799,38 @@ def _remaining_admin_fields(
         if not _clean_text(final_value):
             missing_fields.append(field_name)
     return missing_fields
+
+
+def _merge_boundary_matches(
+    boundary_match: RegionMatch | None,
+    arrond_match: RegionMatch | None,
+) -> RegionMatch | None:
+    if boundary_match is None and arrond_match is None:
+        return None
+
+    if boundary_match is not None:
+        merged_attributes = dict(boundary_match.attributes)
+        if arrond_match is not None:
+            merged_attributes["arrondissement"] = arrond_match.attributes
+        return RegionMatch(
+            source_label=boundary_match.source_label,
+            name=boundary_match.name,
+            code=boundary_match.code,
+            mrc_name=boundary_match.mrc_name,
+            muni_name=boundary_match.muni_name,
+            arrond_name=arrond_match.arrond_name or arrond_match.name if arrond_match else None,
+            attributes=merged_attributes,
+        )
+
+    return RegionMatch(
+        source_label=arrond_match.source_label,
+        name=None,
+        code=None,
+        mrc_name=None,
+        muni_name=None,
+        arrond_name=arrond_match.arrond_name or arrond_match.name,
+        attributes={"arrondissement": arrond_match.attributes},
+    )
 
 
 def _should_include_in_failure_report(item: dict[str, Any]) -> bool:
@@ -828,6 +879,8 @@ def _write_failure_report(path: Path, payload: dict[str, Any], logger: logging.L
     headers = [
         "quote_id",
         "status",
+        "status_reason",
+        "google_status",
         "missing_shipping_fields",
         "missing_coordinate_fields",
         "missing_admin_fields",
@@ -843,6 +896,7 @@ def _write_failure_report(path: Path, payload: dict[str, Any], logger: logging.L
         "current_region_code",
         "current_mrc_name",
         "current_muni_name",
+        "current_arrond_name",
         "geocoded_latitude",
         "geocoded_longitude",
         "geocoded_formatted_address",
@@ -852,7 +906,9 @@ def _write_failure_report(path: Path, payload: dict[str, Any], logger: logging.L
         "resolved_region_code",
         "resolved_mrc_name",
         "resolved_muni_name",
+        "resolved_arrond_name",
         "region_match_source",
+        "arrond_match_source",
         "error",
         "raw_address_fields",
         "update_response",
@@ -867,6 +923,8 @@ def _write_failure_report(path: Path, payload: dict[str, Any], logger: logging.L
             [
                 item.get("quote_id", ""),
                 item.get("status", ""),
+                item.get("status_reason", ""),
+                item.get("google_status", ""),
                 ", ".join(item.get("missing_shipping_fields") or []),
                 ", ".join(item.get("missing_coordinate_fields") or []),
                 ", ".join(item.get("missing_admin_fields") or []),
@@ -882,6 +940,7 @@ def _write_failure_report(path: Path, payload: dict[str, Any], logger: logging.L
                 item.get("current_region_code", ""),
                 item.get("current_mrc_name", ""),
                 item.get("current_muni_name", ""),
+                item.get("current_arrond_name", ""),
                 geocode.get("latitude", ""),
                 geocode.get("longitude", ""),
                 geocode.get("formatted_address", ""),
@@ -891,7 +950,9 @@ def _write_failure_report(path: Path, payload: dict[str, Any], logger: logging.L
                 item.get("resolved_region_code", ""),
                 item.get("resolved_mrc_name", ""),
                 item.get("resolved_muni_name", ""),
+                item.get("resolved_arrond_name", ""),
                 item.get("region_match_source", ""),
+                item.get("arrond_match_source", ""),
                 item.get("error", ""),
                 _json_string(item.get("address_fields")),
                 _json_string(item.get("update_response")),
@@ -908,6 +969,86 @@ def _write_failure_report(path: Path, payload: dict[str, Any], logger: logging.L
     path.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(path)
     logger.info("Wrote Excel failure report to %s with %s issue rows", path, len(issue_rows))
+    return path, len(issue_rows)
+
+
+def _should_include_in_google_error_report(item: dict[str, Any]) -> bool:
+    return item.get("status") in {"no_geocode_result", "geocode_error"}
+
+
+def _write_google_error_report(path: Path, payload: dict[str, Any], logger: logging.Logger) -> tuple[Path, int]:
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+    except ImportError as exc:  # pragma: no cover - dependency should be installed by package
+        raise ConfigError(
+            "openpyxl is required to create the Excel Google error report. "
+            "Install dependencies again or upgrade the package."
+        ) from exc
+
+    issue_rows = [item for item in payload.get("items", []) if _should_include_in_google_error_report(item)]
+    workbook = Workbook()
+
+    summary_sheet = workbook.active
+    summary_sheet.title = "summary"
+    summary_sheet.append(["metric", "value"])
+    for cell in summary_sheet[1]:
+        cell.font = Font(bold=True)
+    for key, value in (payload.get("summary") or {}).items():
+        if key in {"fetched", "no_geocode_result", "geocode_errors"}:
+            summary_sheet.append([key, value])
+    summary_sheet.append(["google_issue_rows", len(issue_rows)])
+    summary_sheet.freeze_panes = "A2"
+
+    issues_sheet = workbook.create_sheet("google_errors")
+    headers = [
+        "quote_id",
+        "status",
+        "status_reason",
+        "google_status",
+        "formatted_address",
+        "shipping_street",
+        "shipping_city",
+        "shipping_state",
+        "shipping_postal_code",
+        "shipping_country",
+        "missing_shipping_fields",
+        "error",
+        "raw_address_fields",
+    ]
+    issues_sheet.append(headers)
+    for cell in issues_sheet[1]:
+        cell.font = Font(bold=True)
+
+    for item in issue_rows:
+        issues_sheet.append(
+            [
+                item.get("quote_id", ""),
+                item.get("status", ""),
+                item.get("status_reason", ""),
+                item.get("google_status", ""),
+                item.get("formatted_address", ""),
+                item.get("shipping_street", ""),
+                item.get("shipping_city", ""),
+                item.get("shipping_state", ""),
+                item.get("shipping_postal_code", ""),
+                item.get("shipping_country", ""),
+                ", ".join(item.get("missing_shipping_fields") or []),
+                item.get("error", ""),
+                _json_string(item.get("address_fields")),
+            ]
+        )
+
+    for sheet in (summary_sheet, issues_sheet):
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        for column_cells in sheet.columns:
+            width = max(len(str(cell.value or "")) for cell in column_cells)
+            sheet.column_dimensions[column_cells[0].column_letter].width = min(max(width + 2, 12), 48)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(path)
+    logger.info("Wrote Google geocode error report to %s with %s issue rows", path, len(issue_rows))
     return path, len(issue_rows)
 
 
@@ -955,6 +1096,7 @@ def sync_quote_coordinates(
     skip_existing: bool = True,
     dry_run: bool = False,
 ) -> dict[str, Any]:
+    logger = zoho_client.logger
     records = fetch_quote_shipping_addresses(zoho_client, max_records=max_records)
     summary = {
         "fetched": len(records),
@@ -971,16 +1113,28 @@ def sync_quote_coordinates(
     for record in records:
         item = _build_record_item(record, zoho_client.field_config)
         address = record.formatted_address()
+        item["geocode_request_address"] = address
 
         if not address:
             item["status"] = "skipped_missing_address"
+            item["status_reason"] = "No formatted address could be built from the configured shipping fields."
             summary["skipped_missing_address"] += 1
+            logger.warning(
+                "Quote %s skipped in geocode sync: missing address fields: %s",
+                record.quote_id,
+                ", ".join(item.get("missing_shipping_fields") or []),
+            )
             items.append(item)
             continue
 
         if skip_existing and record.has_coordinates():
             item["status"] = "skipped_existing_coordinates"
+            item["status_reason"] = "Quote already has both latitude and longitude."
             summary["skipped_existing_coordinates"] += 1
+            logger.info(
+                "Quote %s skipped in geocode sync: latitude/longitude already populated.",
+                record.quote_id,
+            )
             items.append(item)
             continue
 
@@ -988,22 +1142,49 @@ def sync_quote_coordinates(
             geocode = geocoder.geocode(address)
         except GoogleGeocodeError as exc:
             item["status"] = "geocode_error"
+            item["status_reason"] = "Google Geocoding API returned an error."
+            item["google_status"] = "ERROR"
             item["error"] = str(exc)
             summary["geocode_errors"] += 1
+            logger.warning(
+                "Quote %s geocode error for address '%s': %s",
+                record.quote_id,
+                address,
+                exc,
+            )
             items.append(item)
             continue
 
         if geocode is None:
             item["status"] = "no_geocode_result"
+            item["status_reason"] = "Google Geocoding returned ZERO_RESULTS for the formatted address."
+            item["google_status"] = "ZERO_RESULTS"
             summary["no_geocode_result"] += 1
+            logger.warning(
+                "Quote %s geocode returned ZERO_RESULTS for address '%s'.",
+                record.quote_id,
+                address,
+            )
             items.append(item)
             continue
 
         item["geocode"] = geocode.to_dict()
+        item["google_status"] = "OK"
+        item["coordinate_update_values"] = {
+            "latitude": geocode.latitude,
+            "longitude": geocode.longitude,
+        }
 
         if dry_run:
             item["status"] = "dry_run"
+            item["status_reason"] = "Geocoding succeeded, but CRM update was skipped because dry-run mode is enabled."
             summary["dry_run"] += 1
+            logger.info(
+                "Quote %s geocoded successfully in dry-run mode: lat=%s long=%s",
+                record.quote_id,
+                geocode.latitude,
+                geocode.longitude,
+            )
             items.append(item)
             continue
 
@@ -1015,14 +1196,27 @@ def sync_quote_coordinates(
             )
         except ZohoApiError as exc:
             item["status"] = "update_error"
+            item["status_reason"] = "Zoho CRM rejected the latitude/longitude update."
             item["error"] = str(exc)
             summary["update_errors"] += 1
+            logger.warning(
+                "Quote %s geocoded but Zoho update failed: %s",
+                record.quote_id,
+                exc,
+            )
             items.append(item)
             continue
 
         item["status"] = "updated"
+        item["status_reason"] = "Latitude and longitude were updated in Zoho CRM."
         item["update_response"] = update_response
         summary["updated"] += 1
+        logger.info(
+            "Quote %s updated with latitude=%s longitude=%s",
+            record.quote_id,
+            geocode.latitude,
+            geocode.longitude,
+        )
         items.append(item)
 
     return {
@@ -1035,9 +1229,11 @@ def sync_quote_regions(
     zoho_client: ZohoCrmClient,
     resolvers: list[RegionShapeResolver],
     *,
+    arrond_resolver: RegionShapeResolver | None = None,
     max_records: int | None = None,
     update_existing: bool = False,
 ) -> dict[str, Any]:
+    logger = zoho_client.logger
     if not zoho_client.field_config.latitude_field or not zoho_client.field_config.longitude_field:
         raise ConfigError(
             "Latitude and longitude field API names are required for region sync. "
@@ -1049,12 +1245,18 @@ def sync_quote_regions(
             zoho_client.field_config.region_code_field,
             zoho_client.field_config.mrc_name_field,
             zoho_client.field_config.muni_name_field,
+            zoho_client.field_config.arrond_name_field,
         ]
     ):
         raise ConfigError(
             "At least one admin-boundary target field is required for region sync. "
             "Set one or more of ZOHO_QUOTE_REGION_NAME_FIELD, ZOHO_QUOTE_REGION_CODE_FIELD, "
-            "ZOHO_QUOTE_MRC_NAME_FIELD, or ZOHO_QUOTE_MUNI_NAME_FIELD."
+            "ZOHO_QUOTE_MRC_NAME_FIELD, ZOHO_QUOTE_MUNI_NAME_FIELD, or ZOHO_QUOTE_ARRON_NAME_FIELD."
+        )
+    if zoho_client.field_config.arrond_name_field and arrond_resolver is None:
+        raise ConfigError(
+            "An arrondissement target field was configured, but no arrondissement shapefile was provided. "
+            "Set ZOHO_ARRON_SHAPE_PATH or pass --arron-shape-path."
         )
 
     records = fetch_quote_shipping_addresses(zoho_client, max_records=max_records)
@@ -1068,6 +1270,7 @@ def sync_quote_regions(
         "no_admin_update_values": 0,
         "region_lookup_errors": 0,
         "update_errors": 0,
+        "matched_by_arrondissement": 0,
         "matched_by_muni": 0,
         "matched_by_mrc": 0,
         "matched_by_region": 0,
@@ -1080,50 +1283,93 @@ def sync_quote_regions(
 
         if record.current_latitude is None or record.current_longitude is None:
             item["status"] = "skipped_missing_coordinates"
+            item["status_reason"] = "Quote is missing latitude and/or longitude, so no polygon lookup was attempted."
             summary["skipped_missing_coordinates"] += 1
+            logger.warning(
+                "Quote %s skipped in region sync: missing latitude/longitude.",
+                record.quote_id,
+            )
             items.append(item)
             continue
 
         configured_admin_targets = _admin_target_specs(record, zoho_client.field_config)
         if not update_existing and configured_admin_targets and all(current_value for _, current_value, _ in configured_admin_targets):
             item["status"] = "skipped_existing_admin_fields"
+            item["status_reason"] = "All requested admin-boundary fields already have values."
             item["missing_admin_fields"] = []
             summary["skipped_existing_admin_fields"] += 1
+            logger.info(
+                "Quote %s skipped in region sync: all requested admin fields already populated.",
+                record.quote_id,
+            )
             items.append(item)
             continue
 
         try:
-            match = None
+            boundary_match = None
             for resolver in resolvers:
-                match = resolver.lookup(record.current_longitude, record.current_latitude)
-                if match is not None:
+                boundary_match = resolver.lookup(record.current_longitude, record.current_latitude)
+                if boundary_match is not None:
                     break
         except Exception as exc:  # pragma: no cover - unexpected shape parsing/runtime failure
             item["status"] = "region_lookup_error"
+            item["status_reason"] = "The shapefile lookup failed while resolving the quote point."
             item["error"] = str(exc)
             summary["region_lookup_errors"] += 1
+            logger.warning("Quote %s region lookup failed: %s", record.quote_id, exc)
             items.append(item)
             continue
 
+        try:
+            arrond_match = (
+                arrond_resolver.lookup(record.current_longitude, record.current_latitude)
+                if arrond_resolver is not None
+                else None
+            )
+        except Exception as exc:  # pragma: no cover - unexpected shape parsing/runtime failure
+            item["status"] = "region_lookup_error"
+            item["status_reason"] = "The arrondissement shapefile lookup failed while resolving the quote point."
+            item["error"] = str(exc)
+            summary["region_lookup_errors"] += 1
+            logger.warning("Quote %s arrondissement lookup failed: %s", record.quote_id, exc)
+            items.append(item)
+            continue
+
+        if boundary_match is None:
+            summary["no_region_match"] += 1
+        else:
+            item["region_match_source"] = boundary_match.source_label
+            item["resolved_region_name"] = boundary_match.name
+            item["resolved_region_code"] = boundary_match.code
+            item["resolved_mrc_name"] = boundary_match.mrc_name
+            item["resolved_muni_name"] = boundary_match.muni_name
+            if boundary_match.source_label == "municipality":
+                summary["matched_by_muni"] += 1
+            elif boundary_match.source_label == "mrc":
+                summary["matched_by_mrc"] += 1
+            else:
+                summary["matched_by_region"] += 1
+
+        if arrond_match is not None:
+            item["arrond_match_source"] = arrond_match.source_label
+            item["resolved_arrond_name"] = arrond_match.arrond_name or arrond_match.name
+            summary["matched_by_arrondissement"] += 1
+
+        match = _merge_boundary_matches(boundary_match, arrond_match)
         if match is None:
             item["status"] = "no_region_match"
+            item["status_reason"] = "No configured shapefile polygon contained the quote coordinates."
             item["missing_admin_fields"] = _remaining_admin_fields(record, zoho_client.field_config)
-            summary["no_region_match"] += 1
+            logger.warning(
+                "Quote %s had no boundary match for latitude=%s longitude=%s.",
+                record.quote_id,
+                record.current_latitude,
+                record.current_longitude,
+            )
             items.append(item)
             continue
 
-        item["region_match_source"] = match.source_label
-        item["resolved_region_name"] = match.name
-        item["resolved_region_code"] = match.code
-        item["resolved_mrc_name"] = match.mrc_name
-        item["resolved_muni_name"] = match.muni_name
         item["resolved_region_attributes"] = match.attributes
-        if match.source_label == "municipality":
-            summary["matched_by_muni"] += 1
-        elif match.source_label == "mrc":
-            summary["matched_by_mrc"] += 1
-        else:
-            summary["matched_by_region"] += 1
 
         update_values: dict[str, Any] = {}
         for field_name, current_value, resolved_value in _admin_target_specs(record, zoho_client.field_config, match):
@@ -1133,10 +1379,16 @@ def sync_quote_regions(
                 update_values[field_name] = resolved_value
 
         item["missing_admin_fields"] = _remaining_admin_fields(record, zoho_client.field_config, update_values)
+        item["admin_update_values"] = update_values
 
         if not update_values:
             item["status"] = "no_admin_update_values"
+            item["status_reason"] = "Boundary lookup succeeded, but none of the resolved values needed to be written to Zoho."
             summary["no_admin_update_values"] += 1
+            logger.info(
+                "Quote %s boundary lookup resolved values, but no Zoho fields needed updating.",
+                record.quote_id,
+            )
             items.append(item)
             continue
 
@@ -1144,17 +1396,30 @@ def sync_quote_regions(
             update_response = zoho_client.update_quote_fields(record.quote_id, update_values)
         except ZohoApiError as exc:
             item["status"] = "update_error"
+            item["status_reason"] = "Zoho CRM rejected the boundary field update."
             item["error"] = str(exc)
             summary["update_errors"] += 1
+            logger.warning("Quote %s boundary update failed: %s", record.quote_id, exc)
             items.append(item)
             continue
 
         item["status"] = "updated_partial" if item["missing_admin_fields"] else "updated"
+        item["status_reason"] = (
+            "Boundary fields were updated, but one or more requested fields are still unresolved."
+            if item["missing_admin_fields"]
+            else "All requested boundary fields were updated in Zoho CRM."
+        )
         item["update_response"] = update_response
         if item["missing_admin_fields"]:
             summary["updated_partial"] += 1
+            logger.info(
+                "Quote %s boundary fields updated partially. Missing after update: %s",
+                record.quote_id,
+                ", ".join(item["missing_admin_fields"]),
+            )
         else:
             summary["updated"] += 1
+            logger.info("Quote %s boundary fields updated successfully.", record.quote_id)
         items.append(item)
 
     return {
@@ -1174,7 +1439,7 @@ def build_parser() -> argparse.ArgumentParser:
     sync_parser = subparsers.add_parser("sync", help="Fetch quotes, geocode shipping addresses, and update CRM.")
     region_parser = subparsers.add_parser(
         "region-sync",
-        help="Use quote latitude/longitude to resolve municipality, MRC, and region polygons and update quote fields.",
+        help="Use quote latitude/longitude to resolve arrondissement, municipality, MRC, and region polygons and update quote fields.",
     )
 
     for current_parser in (fetch_parser, sync_parser, region_parser):
@@ -1298,6 +1563,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path(_read_env("ZOHO_QUOTE_FAILURE_REPORT_PATH", default="quote-geolocation-failures.xlsx") or "quote-geolocation-failures.xlsx"),
         help="Excel report path for quotes with missing shipping fields or failed updates.",
     )
+    sync_parser.add_argument(
+        "--google-error-report",
+        type=Path,
+        default=Path(_read_env("ZOHO_GOOGLE_ERROR_REPORT_PATH", default="quote-google-geocode-errors.xlsx") or "quote-google-geocode-errors.xlsx"),
+        help="Excel report path for quotes where Google geocoding returned ZERO_RESULTS or an API error.",
+    )
 
     for region_target_parser in (sync_parser, region_parser):
         region_target_parser.add_argument(
@@ -1330,6 +1601,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--muni-name-field",
         default=_read_env("ZOHO_QUOTE_MUNI_NAME_FIELD"),
         help="Zoho quote field API name to update with the matched municipality name.",
+    )
+    region_parser.add_argument(
+        "--arron-name-field",
+        default=_read_env("ZOHO_QUOTE_ARRON_NAME_FIELD"),
+        help="Zoho quote field API name to update with the matched arrondissement name.",
+    )
+    region_parser.add_argument(
+        "--arron-shape-path",
+        type=Path,
+        default=Path(_read_env("ZOHO_ARRON_SHAPE_PATH")) if _read_env("ZOHO_ARRON_SHAPE_PATH") else None,
+        help="Optional arrondissement shapefile (.shp) path for borough-level results such as Montreal arrondissements.",
+    )
+    region_parser.add_argument(
+        "--arron-name-attribute",
+        default=_read_env("ZOHO_ARRON_NAME_ATTRIBUTE", default="ARS_NM_ARR"),
+        help="Arrondissement shapefile attribute that contains the arrondissement name.",
     )
     region_parser.add_argument(
         "--muni-shape-path",
@@ -1421,7 +1708,7 @@ def build_parser() -> argparse.ArgumentParser:
     region_parser.add_argument(
         "--update-existing-region",
         action="store_true",
-        help="Update Region, MRC, and Muni fields even when the quote already has values.",
+        help="Update Region, MRC, Muni, and Arrondissement fields even when the quote already has values.",
     )
 
     return parser
@@ -1451,10 +1738,24 @@ def _build_configs(args: argparse.Namespace) -> tuple[ZohoAuthConfig, QuoteField
         region_code_field=getattr(args, "region_code_field", None),
         mrc_name_field=getattr(args, "mrc_name_field", None),
         muni_name_field=getattr(args, "muni_name_field", None),
+        arrond_name_field=getattr(args, "arron_name_field", None),
         coordinate_decimal_places=args.coordinate_decimals,
         coordinate_max_length=args.coordinate_max_length,
     )
     return zoho_config, field_config
+
+
+def _build_arrond_lookup_config(args: argparse.Namespace) -> RegionLookupConfig | None:
+    arron_shape_path = getattr(args, "arron_shape_path", None)
+    if not arron_shape_path:
+        return None
+    return RegionLookupConfig(
+        source_label="arrondissement",
+        shape_path=Path(arron_shape_path),
+        region_name_attribute=args.arron_name_attribute,
+        region_code_attribute=None,
+        arrond_name_attribute=args.arron_name_attribute,
+    )
 
 
 def _build_region_lookup_configs(args: argparse.Namespace) -> list[RegionLookupConfig]:
@@ -1552,11 +1853,14 @@ def main(argv: list[str] | None = None) -> int:
                     )
             else:
                 region_configs = _build_region_lookup_configs(args)
+                arrond_config = _build_arrond_lookup_config(args)
                 with ExitStack() as stack:
                     resolvers = [stack.enter_context(RegionShapeResolver(config, logger)) for config in region_configs]
+                    arrond_resolver = stack.enter_context(RegionShapeResolver(arrond_config, logger)) if arrond_config else None
                     payload = sync_quote_regions(
                         zoho_client,
                         resolvers,
+                        arrond_resolver=arrond_resolver,
                         max_records=args.max_records,
                         update_existing=args.update_existing_region,
                     )
@@ -1564,6 +1868,15 @@ def main(argv: list[str] | None = None) -> int:
     except (ConfigError, ZohoApiError, GoogleGeocodeError, shapefile.ShapefileException) as exc:
         logger.error(str(exc))
         return 1
+
+    payload["meta"] = {
+        "app_name": APP_NAME,
+        "app_version": APP_VERSION,
+        "command": args.command,
+        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "module": args.module,
+        "max_records": args.max_records,
+    }
 
     if args.command in {"sync", "region-sync"} and args.failure_report:
         try:
@@ -1573,6 +1886,15 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         payload["failure_report_path"] = str(report_path)
         payload["failure_report_issue_count"] = issue_count
+
+    if args.command == "sync" and args.google_error_report:
+        try:
+            google_report_path, google_issue_count = _write_google_error_report(args.google_error_report, payload, logger)
+        except ConfigError as exc:
+            logger.error(str(exc))
+            return 1
+        payload["google_error_report_path"] = str(google_report_path)
+        payload["google_error_report_issue_count"] = google_issue_count
 
     if args.output:
         _write_json(args.output, payload)
@@ -1599,7 +1921,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         else:
             logger.info(
-                "Fetched=%s Updated=%s UpdatedPartial=%s MissingCoordinates=%s ExistingAdmin=%s NoRegionMatch=%s NoAdminUpdates=%s RegionLookupErrors=%s UpdateErrors=%s MatchedByMuni=%s MatchedByMrc=%s MatchedByRegion=%s",
+                "Fetched=%s Updated=%s UpdatedPartial=%s MissingCoordinates=%s ExistingAdmin=%s NoRegionMatch=%s NoAdminUpdates=%s RegionLookupErrors=%s UpdateErrors=%s MatchedByArrondissement=%s MatchedByMuni=%s MatchedByMrc=%s MatchedByRegion=%s",
                 summary["fetched"],
                 summary["updated"],
                 summary["updated_partial"],
@@ -1609,6 +1931,7 @@ def main(argv: list[str] | None = None) -> int:
                 summary["no_admin_update_values"],
                 summary["region_lookup_errors"],
                 summary["update_errors"],
+                summary["matched_by_arrondissement"],
                 summary["matched_by_muni"],
                 summary["matched_by_mrc"],
                 summary["matched_by_region"],

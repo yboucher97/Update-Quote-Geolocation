@@ -5,7 +5,7 @@ Standalone Python utility for Zoho CRM quote geolocation and boundary enrichment
 It supports two main jobs:
 
 1. fetch quote shipping addresses from Zoho CRM, geocode them with Google, and write latitude/longitude back to the quote
-2. use existing quote latitude/longitude values with shapefiles to resolve and update `Region`, `MRC`, and `Muni`
+2. use existing quote latitude/longitude values with shapefiles to resolve and update `Region`, `MRC`, `Muni`, and optionally `Arrondissement`
 
 ## What Each File Does
 
@@ -13,7 +13,7 @@ It supports two main jobs:
   Main application. Commands:
   - `fetch`: export quote IDs and shipping address fields
   - `sync`: geocode shipping addresses and update quote latitude/longitude
-  - `region-sync`: resolve municipality, MRC, and region from shapefiles and update CRM fields
+  - `region-sync`: resolve arrondissement, municipality, MRC, and region from shapefiles and update CRM fields
 
 - `zoho_quote_geocode.env.example`
   Template config file. This shows where to put Zoho OAuth details, Google API key, Zoho field API names, and shapefile paths.
@@ -132,6 +132,9 @@ These variables are the Zoho auth and connection settings:
 - `GOOGLE_MAPS_API_KEY`
   Google Geocoding API key.
 
+- `ZOHO_GOOGLE_ERROR_REPORT_PATH`
+  Default Excel output path for quotes where Google returned `ZERO_RESULTS` or an API error.
+
 ## Where To Change Zoho Field Names
 
 Set these in the same env file:
@@ -148,6 +151,7 @@ Set these in the same env file:
 - `ZOHO_QUOTE_REGION_CODE_FIELD`
 - `ZOHO_QUOTE_MRC_NAME_FIELD`
 - `ZOHO_QUOTE_MUNI_NAME_FIELD`
+- `ZOHO_QUOTE_ARRON_NAME_FIELD`
 - `ZOHO_QUOTE_COORD_DECIMALS`
 - `ZOHO_QUOTE_COORD_MAX_LENGTH`
 
@@ -162,6 +166,7 @@ You gave two shapefile sources:
 
 - `SHP`
   This is a fuller Quebec boundary set. It includes multiple layers:
+  - `arron_s.shp`: arrondissement polygons, useful for Montreal boroughs
   - `munic_s.shp`: municipality polygons, most precise
   - `mrc_s.shp`: MRC polygons, medium precision
   - `regio_s.shp`: region polygons, least precise
@@ -169,11 +174,12 @@ You gave two shapefile sources:
 
 For your use case, the right order is:
 
-1. `munic_s.shp`
-2. `mrc_s.shp`
-3. `regio_s.shp`
+1. `arron_s.shp` as an optional overlay for arrondissement-level results
+2. `munic_s.shp`
+3. `mrc_s.shp`
+4. `regio_s.shp`
 
-`region-sync` now follows that idea: municipality first, then MRC, then region.
+`region-sync` now follows that idea: arrondissement overlay first when configured, then municipality, then MRC, then region.
 
 Important:
 
@@ -186,9 +192,15 @@ Recommended Linux paths:
 /opt/update-quote-geolocation/shapes/SHP/munic_s.shp
 /opt/update-quote-geolocation/shapes/SHP/mrc_s.shp
 /opt/update-quote-geolocation/shapes/SHP/regio_s.shp
+/opt/update-quote-geolocation/shapes/SHP/arron_s.shp
 ```
 
 ## Shapefile Config Variables
+
+Arrondissement overlay layer:
+
+- `ZOHO_ARRON_SHAPE_PATH`
+- `ZOHO_ARRON_NAME_ATTRIBUTE`
 
 Municipality layer:
 
@@ -212,6 +224,9 @@ Region fallback layer:
 - `ZOHO_REGION_CODE_ATTRIBUTE`
 
 Default Quebec attribute names already match the files you provided:
+
+- `arron_s.shp`
+  - arrondissement: `ARS_NM_ARR`
 
 - `munic_s.shp`
   - municipality: `MUS_NM_MUN`
@@ -246,7 +261,9 @@ ZOHO_QUOTE_LONGITUDE_FIELD=Long
 ZOHO_QUOTE_REGION_NAME_FIELD=Region
 ZOHO_QUOTE_MRC_NAME_FIELD=MRC
 ZOHO_QUOTE_MUNI_NAME_FIELD=Muni
+ZOHO_QUOTE_ARRON_NAME_FIELD=Arrondissement
 
+ZOHO_ARRON_SHAPE_PATH=/opt/update-quote-geolocation/shapes/SHP/arron_s.shp
 ZOHO_MUNI_SHAPE_PATH=/opt/update-quote-geolocation/shapes/SHP/munic_s.shp
 ZOHO_MRC_SHAPE_PATH=/opt/update-quote-geolocation/shapes/SHP/mrc_s.shp
 ZOHO_REGION_SHAPE_PATH=/opt/update-quote-geolocation/shapes/SHP/regio_s.shp
@@ -281,7 +298,7 @@ update-quote-geolocation sync \
   --failure-report live-5-sync-failures.xlsx
 ```
 
-Run a live 5-record boundary update test for `Region`, `MRC`, and `Muni`:
+Run a live 5-record boundary update test for `Region`, `MRC`, `Muni`, and optionally `Arrondissement`:
 
 ```bash
 update-quote-geolocation region-sync \
@@ -290,7 +307,7 @@ update-quote-geolocation region-sync \
   --failure-report live-5-region-failures.xlsx
 ```
 
-If you want to overwrite already-populated Region, MRC, or Muni values:
+If you want to overwrite already-populated Region, MRC, Muni, or Arrondissement values:
 
 ```bash
 update-quote-geolocation region-sync \
@@ -310,6 +327,11 @@ update-quote-geolocation --version
 
 `sync` writes an Excel report for quotes with missing shipping fields, geocoding failures, or CRM update failures.
 
+`sync` also writes a dedicated Google geocode Excel report for:
+
+- `ZERO_RESULTS`
+- Google API errors
+
 `region-sync` writes an Excel report for quotes when any of these happened:
 
 - latitude or longitude was missing
@@ -326,17 +348,25 @@ Each issue row includes:
 - missing admin fields
 - full shipping address columns
 - current lat/long
-- current Region, MRC, and Muni values
-- resolved Region, MRC, and Muni values
+- current Region, MRC, Muni, and Arrondissement values
+- resolved Region, MRC, Muni, and Arrondissement values
 - match source layer
 - any error text
 - raw field payload
 - Zoho update response
 
+The JSON output now includes:
+
+- `meta` with command, version, timestamp, module, and max-records
+- `status_reason` on each quote item
+- `google_status` on geocode items
+- `coordinate_update_values` or `admin_update_values` when applicable
+
 ## Notes
 
 - Quotes with existing latitude and longitude are skipped in `sync` unless you pass `--update-existing`.
-- Quotes with all requested Region, MRC, and Muni fields already filled are skipped in `region-sync` unless you pass `--update-existing-region`.
+- Quotes with all requested Region, MRC, Muni, and Arrondissement fields already filled are skipped in `region-sync` unless you pass `--update-existing-region`.
+- `sync` now logs one line per quote explaining whether it was updated, skipped, or failed.
 - With refresh-token auth, the script uses Zoho's returned `api_domain` automatically.
 - Coordinate values are rounded before update so they fit Zoho decimal field limits more reliably.
 - The public APT source is published from the `gh-pages` branch and consumed through `raw.githubusercontent.com`.
