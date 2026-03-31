@@ -3,6 +3,7 @@
 Standalone Python utility for Zoho CRM quote geolocation.
 
 It fetches quotes from Zoho CRM, builds a list of quote IDs plus shipping address fields, formats each address, sends it to the Google Geocoding API, and updates the quote latitude/longitude fields in Zoho CRM.
+It can also use existing quote latitude/longitude values with a shapefile to resolve and update a region field in Zoho CRM.
 
 ## What you get
 
@@ -173,6 +174,11 @@ Change these in the same env file:
 - `ZOHO_QUOTE_LONGITUDE_FIELD`
 - `ZOHO_QUOTE_COORD_DECIMALS`
 - `ZOHO_QUOTE_COORD_MAX_LENGTH`
+- `ZOHO_QUOTE_REGION_NAME_FIELD`
+- `ZOHO_QUOTE_REGION_CODE_FIELD`
+- `ZOHO_REGION_SHAPE_PATH`
+- `ZOHO_REGION_NAME_ATTRIBUTE`
+- `ZOHO_REGION_CODE_ATTRIBUTE`
 
 The latitude and longitude values must match your real Zoho CRM field API names.
 By default, the updater rounds coordinates to 9 decimal places and keeps the rendered value at or under 16 characters before sending it to Zoho.
@@ -226,6 +232,15 @@ update-quote-geolocation sync \
   --coordinate-max-length 16
 ```
 
+Sync regions from a shapefile using existing coordinates:
+
+```bash
+update-quote-geolocation region-sync \
+  --max-records 5 \
+  --output live-5-region-sync.json \
+  --failure-report live-5-region-failures.xlsx
+```
+
 ## Excel exception report
 
 Every `sync` run writes an Excel report by default. The default filename is:
@@ -263,6 +278,44 @@ update-quote-geolocation sync \
   --output live-5-sync.json \
   --failure-report live-5-sync-failures.xlsx
 ```
+
+## Region sync with shapefile
+
+If the quote already has latitude and longitude, you can resolve a region from a polygon shapefile and write it back to Zoho.
+
+Set these values in `/etc/update-quote-geolocation/zoho_quote_geocode.env`:
+
+- `ZOHO_QUOTE_REGION_NAME_FIELD`
+- `ZOHO_QUOTE_REGION_CODE_FIELD`
+- `ZOHO_REGION_SHAPE_PATH`
+- `ZOHO_REGION_NAME_ATTRIBUTE`
+- `ZOHO_REGION_CODE_ATTRIBUTE`
+- `ZOHO_REGION_FAILURE_REPORT_PATH`
+
+With the shapefile you provided, the defaults for the source attributes are:
+
+- `RES_NM_REG` for the region name
+- `RES_CO_REG` for the region code
+
+Important:
+
+- The shapefile you gave me is a Quebec administrative region layer, not an MRC layer.
+- If you later want MRC specifically, keep the same command and just point `ZOHO_REGION_SHAPE_PATH` at an MRC shapefile and update the source attribute names.
+
+Example:
+
+```bash
+update-quote-geolocation region-sync \
+  --max-records 5 \
+  --output live-5-region-sync.json \
+  --failure-report live-5-region-failures.xlsx
+```
+
+The region failure Excel report includes one row per quote when:
+
+- latitude or longitude is missing
+- no polygon contains the quote point
+- the Zoho region update fails
 
 ## Notes
 

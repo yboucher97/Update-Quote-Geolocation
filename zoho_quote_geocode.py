@@ -15,6 +15,7 @@ from typing import Any, Iterable
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+import shapefile
 
 APP_NAME = "update-quote-geolocation"
 APP_VERSION = os.getenv("UPDATE_QUOTE_GEOLOCATION_VERSION", "0.1.0")
@@ -157,6 +158,8 @@ class QuoteFieldConfig:
     country_field: str
     latitude_field: str | None
     longitude_field: str | None
+    region_name_field: str | None
+    region_code_field: str | None
     coordinate_decimal_places: int
     coordinate_max_length: int
 
@@ -172,6 +175,10 @@ class QuoteFieldConfig:
             fields.append(self.latitude_field)
         if self.longitude_field:
             fields.append(self.longitude_field)
+        if self.region_name_field:
+            fields.append(self.region_name_field)
+        if self.region_code_field:
+            fields.append(self.region_code_field)
         seen: set[str] = set()
         ordered: list[str] = []
         for field_name in fields:
@@ -191,6 +198,8 @@ class QuoteAddressRecord:
     shipping_country: str | None
     current_latitude: float | None
     current_longitude: float | None
+    current_region_name: str | None
+    current_region_code: str | None
     address_fields: dict[str, Any]
 
     @classmethod
@@ -206,6 +215,10 @@ class QuoteAddressRecord:
             address_fields[fields.latitude_field] = record.get(fields.latitude_field)
         if fields.longitude_field:
             address_fields[fields.longitude_field] = record.get(fields.longitude_field)
+        if fields.region_name_field:
+            address_fields[fields.region_name_field] = record.get(fields.region_name_field)
+        if fields.region_code_field:
+            address_fields[fields.region_code_field] = record.get(fields.region_code_field)
 
         return cls(
             quote_id=str(record["id"]),
@@ -216,6 +229,8 @@ class QuoteAddressRecord:
             shipping_country=_clean_text(record.get(fields.country_field)),
             current_latitude=_coerce_float(record.get(fields.latitude_field)) if fields.latitude_field else None,
             current_longitude=_coerce_float(record.get(fields.longitude_field)) if fields.longitude_field else None,
+            current_region_name=_clean_text(record.get(fields.region_name_field)) if fields.region_name_field else None,
+            current_region_code=_clean_text(record.get(fields.region_code_field)) if fields.region_code_field else None,
             address_fields=address_fields,
         )
 
@@ -255,8 +270,24 @@ class QuoteAddressRecord:
             "shipping_country": self.shipping_country,
             "current_latitude": self.current_latitude,
             "current_longitude": self.current_longitude,
+            "current_region_name": self.current_region_name,
+            "current_region_code": self.current_region_code,
             "address_fields": self.address_fields,
         }
+
+
+@dataclass(slots=True)
+class RegionLookupConfig:
+    shape_path: Path
+    region_name_attribute: str
+    region_code_attribute: str | None
+
+
+@dataclass(slots=True)
+class RegionMatch:
+    name: str | None
+    code: str | None
+    attributes: dict[str, Any]
 
 
 @dataclass(slots=True)
@@ -275,6 +306,135 @@ class GeocodeResult:
             "place_id": self.place_id,
             "location_type": self.location_type,
         }
+
+
+def _split_ring_points(points: list[tuple[float, float]], parts: list[int]) -> list[list[tuple[float, float]]]:
+    ring_starts = list(parts) + [len(points)]
+    rings: list[list[tuple[float, float]]] = []
+    for index in range(len(ring_starts) - 1):
+        ring = points[ring_starts[index] : ring_starts[index + 1]]
+        if ring:
+            rings.append(ring)
+    return rings
+
+
+def _ring_signed_area(ring: list[tuple[float, float]]) -> float:
+    if len(ring) < 3:
+        return 0.0
+    area = 0.0
+    for index, (x1, y1) in enumerate(ring):
+        x2, y2 = ring[(index + 1) % len(ring)]
+        area += (x1 * y2) - (x2 * y1)
+    return area / 2.0
+
+
+def _point_in_ring(x: float, y: float, ring: list[tuple[float, float]]) -> bool:
+    inside = False
+    j = len(ring) - 1
+    for i in range(len(ring)):
+        xi, yi = ring[i]
+        xj, yj = ring[j]
+        intersects = ((yi > y) != (yj > y)) and (
+            x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-12) + xi
+        )
+        if intersects:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _group_polygon_rings(rings: list[list[tuple[float, float]]]) -> list[tuple[list[tuple[float, float]], list[list[tuple[float, float]]]]]:
+    polygons: list[tuple[list[tuple[float, float]], list[list[tuple[float, float]]]]] = []
+    current_outer: list[tuple[float, float]] | None = None
+    current_holes: list[list[tuple[float, float]]] = []
+
+    for ring in rings:
+        signed_area = _ring_signed_area(ring)
+        is_outer = signed_area < 0
+        if is_outer or current_outer is None:
+            if current_outer is not None:
+                polygons.append((current_outer, current_holes))
+            current_outer = ring
+            current_holes = []
+        else:
+            current_holes.append(ring)
+
+    if current_outer is not None:
+        polygons.append((current_outer, current_holes))
+
+    return polygons
+
+
+class RegionShapeResolver:
+    def __init__(self, config: RegionLookupConfig, logger: logging.Logger) -> None:
+        self.config = config
+        self.logger = logger
+        self.shape_path = self._resolve_shape_path(config.shape_path)
+        self.reader = shapefile.Reader(str(self.shape_path), encoding="utf-8")
+        self.fields = [field[0] for field in self.reader.fields[1:]]
+        self.name_index = self._field_index(config.region_name_attribute)
+        self.code_index = self._field_index(config.region_code_attribute) if config.region_code_attribute else None
+        self.records = list(self.reader.iterShapeRecords())
+
+    def __enter__(self) -> "RegionShapeResolver":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.reader.close()
+
+    def lookup(self, longitude: float, latitude: float) -> RegionMatch | None:
+        for shape_record in self.records:
+            shape = shape_record.shape
+            min_x, min_y, max_x, max_y = shape.bbox
+            if longitude < min_x or longitude > max_x or latitude < min_y or latitude > max_y:
+                continue
+
+            rings = _split_ring_points(shape.points, list(shape.parts))
+            polygons = _group_polygon_rings(rings)
+            for outer, holes in polygons:
+                if not _point_in_ring(longitude, latitude, outer):
+                    continue
+                if any(_point_in_ring(longitude, latitude, hole) for hole in holes):
+                    continue
+
+                record_values = list(shape_record.record)
+                attributes = dict(zip(self.fields, record_values))
+                name = _clean_text(record_values[self.name_index]) if self.name_index is not None else None
+                code = (
+                    _clean_text(record_values[self.code_index])
+                    if self.code_index is not None
+                    else None
+                )
+                return RegionMatch(name=name, code=code, attributes=attributes)
+
+        return None
+
+    def _field_index(self, field_name: str | None) -> int | None:
+        if not field_name:
+            return None
+        try:
+            return self.fields.index(field_name)
+        except ValueError as exc:
+            raise ConfigError(
+                f"Shapefile attribute '{field_name}' was not found in {self.shape_path.name}. "
+                f"Available attributes: {', '.join(self.fields)}"
+            ) from exc
+
+    @staticmethod
+    def _resolve_shape_path(path: Path) -> Path:
+        candidate = path.expanduser()
+        if candidate.is_dir():
+            shp_files = sorted(candidate.glob("*.shp"))
+            if len(shp_files) != 1:
+                raise ConfigError(
+                    f"Expected exactly one .shp file in directory '{candidate}', found {len(shp_files)}."
+                )
+            candidate = shp_files[0]
+        if candidate.suffix.lower() != ".shp":
+            raise ConfigError(f"Shape path must point to a .shp file or a folder containing one: {candidate}")
+        if not candidate.exists():
+            raise ConfigError(f"Shapefile not found: {candidate}")
+        return candidate
 
 
 class ZohoCrmClient:
@@ -365,6 +525,19 @@ class ZohoCrmClient:
             ]
         }
 
+        return self._request(
+            "PUT",
+            f"{self.config.api_base_url}/{self.config.module_api_name}/{quote_id}",
+            json=payload,
+        )
+
+    def update_quote_fields(self, quote_id: str, values: dict[str, Any]) -> dict[str, Any]:
+        if not values:
+            raise ConfigError("No values were provided for the Zoho CRM update.")
+
+        payload = {
+            "data": [values]
+        }
         return self._request(
             "PUT",
             f"{self.config.api_base_url}/{self.config.module_api_name}/{quote_id}",
@@ -512,16 +685,28 @@ def _build_record_item(record: QuoteAddressRecord, fields: QuoteFieldConfig) -> 
     missing_fields = record.missing_shipping_fields(fields)
     item["missing_shipping_fields"] = missing_fields
     item["has_missing_shipping_fields"] = bool(missing_fields)
+    missing_coordinate_fields: list[str] = []
+    if fields.latitude_field and record.current_latitude is None:
+        missing_coordinate_fields.append(fields.latitude_field)
+    if fields.longitude_field and record.current_longitude is None:
+        missing_coordinate_fields.append(fields.longitude_field)
+    item["missing_coordinate_fields"] = missing_coordinate_fields
+    item["has_missing_coordinate_fields"] = bool(missing_coordinate_fields)
     return item
 
 
 def _should_include_in_failure_report(item: dict[str, Any]) -> bool:
     if item.get("missing_shipping_fields"):
         return True
+    if item.get("missing_coordinate_fields"):
+        return True
     return item.get("status") in {
         "skipped_missing_address",
+        "skipped_missing_coordinates",
         "no_geocode_result",
         "geocode_error",
+        "region_lookup_error",
+        "no_region_match",
         "update_error",
     }
 
@@ -562,11 +747,15 @@ def _write_failure_report(path: Path, payload: dict[str, Any], logger: logging.L
         "shipping_country",
         "current_latitude",
         "current_longitude",
+        "current_region_name",
+        "current_region_code",
         "geocoded_latitude",
         "geocoded_longitude",
         "geocoded_formatted_address",
         "geocode_place_id",
         "geocode_location_type",
+        "resolved_region_name",
+        "resolved_region_code",
         "error",
         "raw_address_fields",
         "update_response",
@@ -590,11 +779,15 @@ def _write_failure_report(path: Path, payload: dict[str, Any], logger: logging.L
                 item.get("shipping_country", ""),
                 item.get("current_latitude", ""),
                 item.get("current_longitude", ""),
+                item.get("current_region_name", ""),
+                item.get("current_region_code", ""),
                 geocode.get("latitude", ""),
                 geocode.get("longitude", ""),
                 geocode.get("formatted_address", ""),
                 geocode.get("place_id", ""),
                 geocode.get("location_type", ""),
+                item.get("resolved_region_name", ""),
+                item.get("resolved_region_code", ""),
                 item.get("error", ""),
                 _json_string(item.get("address_fields")),
                 _json_string(item.get("update_response")),
@@ -734,6 +927,102 @@ def sync_quote_coordinates(
     }
 
 
+def sync_quote_regions(
+    zoho_client: ZohoCrmClient,
+    resolver: RegionShapeResolver,
+    *,
+    max_records: int | None = None,
+    update_existing: bool = False,
+) -> dict[str, Any]:
+    if not zoho_client.field_config.latitude_field or not zoho_client.field_config.longitude_field:
+        raise ConfigError(
+            "Latitude and longitude field API names are required for region sync. "
+            "Set ZOHO_QUOTE_LATITUDE_FIELD and ZOHO_QUOTE_LONGITUDE_FIELD."
+        )
+    if not zoho_client.field_config.region_name_field and not zoho_client.field_config.region_code_field:
+        raise ConfigError(
+            "At least one region target field is required for region sync. "
+            "Set ZOHO_QUOTE_REGION_NAME_FIELD and/or ZOHO_QUOTE_REGION_CODE_FIELD."
+        )
+
+    records = fetch_quote_shipping_addresses(zoho_client, max_records=max_records)
+    summary = {
+        "fetched": len(records),
+        "updated": 0,
+        "skipped_missing_coordinates": 0,
+        "skipped_existing_region": 0,
+        "no_region_match": 0,
+        "region_lookup_errors": 0,
+        "update_errors": 0,
+    }
+    items: list[dict[str, Any]] = []
+
+    for record in records:
+        item = _build_record_item(record, zoho_client.field_config)
+
+        if record.current_latitude is None or record.current_longitude is None:
+            item["status"] = "skipped_missing_coordinates"
+            summary["skipped_missing_coordinates"] += 1
+            items.append(item)
+            continue
+
+        if (
+            not update_existing
+            and (
+                (zoho_client.field_config.region_name_field and record.current_region_name)
+                or (zoho_client.field_config.region_code_field and record.current_region_code)
+            )
+        ):
+            item["status"] = "skipped_existing_region"
+            summary["skipped_existing_region"] += 1
+            items.append(item)
+            continue
+
+        try:
+            match = resolver.lookup(record.current_longitude, record.current_latitude)
+        except Exception as exc:  # pragma: no cover - unexpected shape parsing/runtime failure
+            item["status"] = "region_lookup_error"
+            item["error"] = str(exc)
+            summary["region_lookup_errors"] += 1
+            items.append(item)
+            continue
+
+        if match is None:
+            item["status"] = "no_region_match"
+            summary["no_region_match"] += 1
+            items.append(item)
+            continue
+
+        item["resolved_region_name"] = match.name
+        item["resolved_region_code"] = match.code
+        item["resolved_region_attributes"] = match.attributes
+
+        update_values: dict[str, Any] = {}
+        if zoho_client.field_config.region_name_field:
+            update_values[zoho_client.field_config.region_name_field] = match.name or ""
+        if zoho_client.field_config.region_code_field:
+            update_values[zoho_client.field_config.region_code_field] = match.code or ""
+
+        try:
+            update_response = zoho_client.update_quote_fields(record.quote_id, update_values)
+        except ZohoApiError as exc:
+            item["status"] = "update_error"
+            item["error"] = str(exc)
+            summary["update_errors"] += 1
+            items.append(item)
+            continue
+
+        item["status"] = "updated"
+        item["update_response"] = update_response
+        summary["updated"] += 1
+        items.append(item)
+
+    return {
+        "summary": summary,
+        "items": items,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Fetch Zoho CRM quotes, geocode shipping addresses with Google, and update latitude/longitude."
@@ -743,8 +1032,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     fetch_parser = subparsers.add_parser("fetch", help="Fetch quotes and export their shipping address fields.")
     sync_parser = subparsers.add_parser("sync", help="Fetch quotes, geocode shipping addresses, and update CRM.")
+    region_parser = subparsers.add_parser(
+        "region-sync",
+        help="Use quote latitude/longitude to resolve a polygon from a shapefile and update quote region fields.",
+    )
 
-    for current_parser in (fetch_parser, sync_parser):
+    for current_parser in (fetch_parser, sync_parser, region_parser):
         current_parser.add_argument(
             "--api-base-url",
             default=_read_env("ZOHO_CRM_API_BASE_URL", default="https://www.zohoapis.com/crm/v7"),
@@ -833,16 +1126,6 @@ def build_parser() -> argparse.ArgumentParser:
         )
 
     sync_parser.add_argument(
-        "--latitude-field",
-        default=_read_env("ZOHO_QUOTE_LATITUDE_FIELD"),
-        help="Latitude field API name in the quote module.",
-    )
-    sync_parser.add_argument(
-        "--longitude-field",
-        default=_read_env("ZOHO_QUOTE_LONGITUDE_FIELD"),
-        help="Longitude field API name in the quote module.",
-    )
-    sync_parser.add_argument(
         "--google-api-key",
         default=_read_env("GOOGLE_MAPS_API_KEY", "GOOGLE_GEOCODING_API_KEY"),
         help="Google Maps Geocoding API key.",
@@ -876,6 +1159,56 @@ def build_parser() -> argparse.ArgumentParser:
         help="Excel report path for quotes with missing shipping fields or failed updates.",
     )
 
+    for region_target_parser in (sync_parser, region_parser):
+        region_target_parser.add_argument(
+            "--latitude-field",
+            default=_read_env("ZOHO_QUOTE_LATITUDE_FIELD"),
+            help="Latitude field API name in the quote module.",
+        )
+        region_target_parser.add_argument(
+            "--longitude-field",
+            default=_read_env("ZOHO_QUOTE_LONGITUDE_FIELD"),
+            help="Longitude field API name in the quote module.",
+        )
+
+    region_parser.add_argument(
+        "--region-name-field",
+        default=_read_env("ZOHO_QUOTE_REGION_NAME_FIELD"),
+        help="Zoho quote field API name to update with the matched region name.",
+    )
+    region_parser.add_argument(
+        "--region-code-field",
+        default=_read_env("ZOHO_QUOTE_REGION_CODE_FIELD"),
+        help="Zoho quote field API name to update with the matched region code.",
+    )
+    region_parser.add_argument(
+        "--shape-path",
+        type=Path,
+        default=Path(_read_env("ZOHO_REGION_SHAPE_PATH", default="") or "."),
+        help="Path to a .shp file or a folder containing one.",
+    )
+    region_parser.add_argument(
+        "--shape-name-attribute",
+        default=_read_env("ZOHO_REGION_NAME_ATTRIBUTE", default="RES_NM_REG"),
+        help="Shapefile attribute name that contains the region name.",
+    )
+    region_parser.add_argument(
+        "--shape-code-attribute",
+        default=_read_env("ZOHO_REGION_CODE_ATTRIBUTE", default="RES_CO_REG"),
+        help="Shapefile attribute name that contains the region code.",
+    )
+    region_parser.add_argument(
+        "--failure-report",
+        type=Path,
+        default=Path(_read_env("ZOHO_REGION_FAILURE_REPORT_PATH", default="quote-region-failures.xlsx") or "quote-region-failures.xlsx"),
+        help="Excel report path for quotes with missing coordinates or failed region updates.",
+    )
+    region_parser.add_argument(
+        "--update-existing-region",
+        action="store_true",
+        help="Update region fields even when the quote already has a region value.",
+    )
+
     return parser
 
 
@@ -899,10 +1232,23 @@ def _build_configs(args: argparse.Namespace) -> tuple[ZohoAuthConfig, QuoteField
         country_field=args.country_field,
         latitude_field=getattr(args, "latitude_field", None),
         longitude_field=getattr(args, "longitude_field", None),
+        region_name_field=getattr(args, "region_name_field", None),
+        region_code_field=getattr(args, "region_code_field", None),
         coordinate_decimal_places=args.coordinate_decimals,
         coordinate_max_length=args.coordinate_max_length,
     )
     return zoho_config, field_config
+
+
+def _build_region_lookup_config(args: argparse.Namespace) -> RegionLookupConfig:
+    shape_path = getattr(args, "shape_path", None)
+    if not shape_path:
+        raise ConfigError("A shapefile path is required for region sync. Set ZOHO_REGION_SHAPE_PATH or pass --shape-path.")
+    return RegionLookupConfig(
+        shape_path=Path(shape_path),
+        region_name_attribute=args.shape_name_attribute,
+        region_code_attribute=args.shape_code_attribute or None,
+    )
 
 
 def _configure_logging(level_name: str) -> logging.Logger:
@@ -928,7 +1274,7 @@ def main(argv: list[str] | None = None) -> int:
                     "count": len(records),
                     "quotes": [record.to_dict() for record in records],
                 }
-            else:
+            elif args.command == "sync":
                 if not args.google_api_key:
                     raise ConfigError(
                         "Google API key is required for sync mode. Set GOOGLE_MAPS_API_KEY or pass --google-api-key."
@@ -948,12 +1294,21 @@ def main(argv: list[str] | None = None) -> int:
                         skip_existing=not args.update_existing,
                         dry_run=args.dry_run,
                     )
+            else:
+                region_config = _build_region_lookup_config(args)
+                with RegionShapeResolver(region_config, logger) as resolver:
+                    payload = sync_quote_regions(
+                        zoho_client,
+                        resolver,
+                        max_records=args.max_records,
+                        update_existing=args.update_existing_region,
+                    )
 
-    except (ConfigError, ZohoApiError, GoogleGeocodeError) as exc:
+    except (ConfigError, ZohoApiError, GoogleGeocodeError, shapefile.ShapefileException) as exc:
         logger.error(str(exc))
         return 1
 
-    if args.command == "sync" and args.failure_report:
+    if args.command in {"sync", "region-sync"} and args.failure_report:
         try:
             report_path, issue_count = _write_failure_report(args.failure_report, payload, logger)
         except ConfigError as exc:
@@ -969,21 +1324,35 @@ def main(argv: list[str] | None = None) -> int:
         json.dump(payload, sys.stdout, indent=2, ensure_ascii=False)
         sys.stdout.write("\n")
 
-    if args.command == "sync":
+    if args.command in {"sync", "region-sync"}:
         summary = payload["summary"]
-        logger.info(
-            "Fetched=%s Updated=%s DryRun=%s MissingAddress=%s ExistingCoordinates=%s NoGeocode=%s GeocodeErrors=%s UpdateErrors=%s",
-            summary["fetched"],
-            summary["updated"],
-            summary["dry_run"],
-            summary["skipped_missing_address"],
-            summary["skipped_existing_coordinates"],
-            summary["no_geocode_result"],
-            summary["geocode_errors"],
-            summary["update_errors"],
-        )
-        if summary["geocode_errors"] or summary["update_errors"]:
-            return 1
+        if args.command == "sync":
+            logger.info(
+                "Fetched=%s Updated=%s DryRun=%s MissingAddress=%s ExistingCoordinates=%s NoGeocode=%s GeocodeErrors=%s UpdateErrors=%s",
+                summary["fetched"],
+                summary["updated"],
+                summary["dry_run"],
+                summary["skipped_missing_address"],
+                summary["skipped_existing_coordinates"],
+                summary["no_geocode_result"],
+                summary["geocode_errors"],
+                summary["update_errors"],
+            )
+            if summary["geocode_errors"] or summary["update_errors"]:
+                return 1
+        else:
+            logger.info(
+                "Fetched=%s Updated=%s MissingCoordinates=%s ExistingRegion=%s NoRegionMatch=%s RegionLookupErrors=%s UpdateErrors=%s",
+                summary["fetched"],
+                summary["updated"],
+                summary["skipped_missing_coordinates"],
+                summary["skipped_existing_region"],
+                summary["no_region_match"],
+                summary["region_lookup_errors"],
+                summary["update_errors"],
+            )
+            if summary["region_lookup_errors"] or summary["update_errors"]:
+                return 1
 
     return 0
 
