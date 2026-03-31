@@ -4,7 +4,7 @@ Standalone Python utility for Zoho CRM quote geolocation and boundary enrichment
 
 The simplest path is now one command:
 
-1. `run`: fetch one quote set, geocode shipping addresses, update `Lat`/`Long`, resolve `Region`/`MRC`/`Muni`/`Arrondissement`, and write one consolidated Excel report
+1. `run`: fetch one quote set, geocode shipping addresses, resolve `Region`/`MRC`/`Muni`/`Arrondissement`, then perform one final Zoho update per quote with every successful value from that run, and write one consolidated Excel report
 
 It still also supports the lower-level jobs:
 
@@ -395,6 +395,8 @@ If you want one readable file instead of separate JSON and Excel outputs, use `r
 - an issues sheet filtered to rows that still need review
 - a raw JSON sheet that embeds the original command outputs
 
+For `run`, the workbook also shows the final combined field payload that was sent to Zoho for each quote at the end of the batch.
+
 `region-sync` writes an Excel report for quotes when any of these happened:
 
 - latitude or longitude was missing
@@ -432,6 +434,7 @@ The JSON output now includes:
 - Quotes with all requested Region, MRC, Muni, and Arrondissement fields already filled are skipped in `region-sync` unless you pass `--update-existing-region`.
 - `sync` now logs one line per quote explaining whether it was updated, skipped, or failed.
 - `run` is the recommended command when you want one live pass and one readable workbook.
+- `run` stages all geocode and boundary results first, then attempts one final Zoho `PUT` per quote using every field that succeeded for that quote.
 - `report` is the best file to review when you already have separate JSON logs and want one readable explanation of the whole run.
 - With refresh-token auth, the script uses Zoho's returned `api_domain` automatically.
 - Coordinate values are rounded before update so they fit Zoho decimal field limits more reliably.

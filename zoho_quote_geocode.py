@@ -363,6 +363,34 @@ class CoordinateContext:
     sync_status: str | None = None
 
 
+def _coordinate_field_values(
+    fields: "QuoteFieldConfig",
+    latitude: float,
+    longitude: float,
+) -> dict[str, Any]:
+    if not fields.latitude_field or not fields.longitude_field:
+        raise ConfigError(
+            "Latitude and longitude field API names are required. "
+            "Set ZOHO_QUOTE_LATITUDE_FIELD and ZOHO_QUOTE_LONGITUDE_FIELD."
+        )
+
+    safe_latitude = _normalize_coordinate(
+        latitude,
+        decimal_places=fields.coordinate_decimal_places,
+        max_length=fields.coordinate_max_length,
+    )
+    safe_longitude = _normalize_coordinate(
+        longitude,
+        decimal_places=fields.coordinate_decimal_places,
+        max_length=fields.coordinate_max_length,
+    )
+
+    return {
+        fields.latitude_field: safe_latitude,
+        fields.longitude_field: safe_longitude,
+    }
+
+
 def _split_ring_points(points: list[tuple[float, float]], parts: list[int]) -> list[list[tuple[float, float]]]:
     ring_starts = list(parts) + [len(points)]
     rings: list[list[tuple[float, float]]] = []
@@ -579,37 +607,9 @@ class ZohoCrmClient:
         return records
 
     def update_quote_coordinates(self, quote_id: str, latitude: float, longitude: float) -> dict[str, Any]:
-        if not self.field_config.latitude_field or not self.field_config.longitude_field:
-            raise ConfigError(
-                "Latitude and longitude field API names are required for sync mode. "
-                "Set ZOHO_QUOTE_LATITUDE_FIELD and ZOHO_QUOTE_LONGITUDE_FIELD, or pass "
-                "--latitude-field and --longitude-field."
-            )
-
-        safe_latitude = _normalize_coordinate(
-            latitude,
-            decimal_places=self.field_config.coordinate_decimal_places,
-            max_length=self.field_config.coordinate_max_length,
-        )
-        safe_longitude = _normalize_coordinate(
-            longitude,
-            decimal_places=self.field_config.coordinate_decimal_places,
-            max_length=self.field_config.coordinate_max_length,
-        )
-
-        payload = {
-            "data": [
-                {
-                    self.field_config.latitude_field: safe_latitude,
-                    self.field_config.longitude_field: safe_longitude,
-                }
-            ]
-        }
-
-        return self._request(
-            "PUT",
-            f"{self.config.api_base_url}/{self.config.module_api_name}/{quote_id}",
-            json=payload,
+        return self.update_quote_fields(
+            quote_id,
+            _coordinate_field_values(self.field_config, latitude, longitude),
         )
 
     def update_quote_fields(self, quote_id: str, values: dict[str, Any]) -> dict[str, Any]:
@@ -1155,6 +1155,8 @@ def _build_run_report(
             "geocoded_latitude": (sync_item.get("geocode") or {}).get("latitude"),
             "geocoded_longitude": (sync_item.get("geocode") or {}).get("longitude"),
             "coordinate_update_values": sync_item.get("coordinate_update_values"),
+            "final_combined_update_values": region_item.get("final_combined_update_values")
+            or sync_item.get("final_combined_update_values"),
             "sync_error": sync_item.get("error"),
             "region_status": region_item.get("status"),
             "region_status_reason": region_item.get("status_reason"),
@@ -1334,6 +1336,7 @@ def _write_run_report(path: Path, payload: dict[str, Any], logger: logging.Logge
         "geocoded_latitude",
         "geocoded_longitude",
         "coordinate_update_values",
+        "final_combined_update_values",
         "sync_error",
         "region_status",
         "region_status_reason",
@@ -1384,6 +1387,7 @@ def _write_run_report(path: Path, payload: dict[str, Any], logger: logging.Logge
                 row.get("geocoded_latitude", ""),
                 row.get("geocoded_longitude", ""),
                 _json_string(row.get("coordinate_update_values")),
+                _json_string(row.get("final_combined_update_values")),
                 row.get("sync_error", ""),
                 row.get("region_status", ""),
                 row.get("region_status_reason", ""),
@@ -1437,6 +1441,7 @@ def _write_run_report(path: Path, payload: dict[str, Any], logger: logging.Logge
                 row.get("geocoded_latitude", ""),
                 row.get("geocoded_longitude", ""),
                 _json_string(row.get("coordinate_update_values")),
+                _json_string(row.get("final_combined_update_values")),
                 row.get("sync_error", ""),
                 row.get("region_status", ""),
                 row.get("region_status_reason", ""),
@@ -1535,6 +1540,7 @@ def _process_quote_coordinate_sync(
     *,
     skip_existing: bool = True,
     dry_run: bool = False,
+    apply_updates: bool = True,
 ) -> tuple[dict[str, Any], dict[str, CoordinateContext]]:
     logger = zoho_client.logger
     summary = {
@@ -1635,6 +1641,20 @@ def _process_quote_coordinate_sync(
             items.append(item)
             continue
 
+        if not apply_updates:
+            item["status"] = "staged_coordinate_update"
+            item["status_reason"] = "Latitude and longitude were resolved and staged for the final Zoho update."
+            coordinate_context.sync_status = item["status"]
+            coordinate_contexts[record.quote_id] = coordinate_context
+            logger.info(
+                "Quote %s geocoded successfully and staged for final CRM update: lat=%s long=%s",
+                record.quote_id,
+                geocode.latitude,
+                geocode.longitude,
+            )
+            items.append(item)
+            continue
+
         try:
             update_response = zoho_client.update_quote_coordinates(
                 record.quote_id,
@@ -1706,6 +1726,7 @@ def _process_quote_region_sync(
     arrond_resolver: RegionShapeResolver | None = None,
     update_existing: bool = False,
     coordinate_contexts: dict[str, CoordinateContext] | None = None,
+    apply_updates: bool = True,
 ) -> dict[str, Any]:
     logger = zoho_client.logger
     if not zoho_client.field_config.latitude_field or not zoho_client.field_config.longitude_field:
@@ -1877,6 +1898,23 @@ def _process_quote_region_sync(
             items.append(item)
             continue
 
+        if not apply_updates:
+            item["status"] = "staged_boundary_partial" if item["missing_admin_fields"] else "staged_boundary_update"
+            item["status_reason"] = (
+                "Boundary values were resolved and staged, but one or more requested fields are still unresolved."
+                if item["missing_admin_fields"]
+                else "All requested boundary values were resolved and staged for the final Zoho update."
+            )
+            logger.info(
+                "Quote %s boundary values staged for final CRM update.%s",
+                record.quote_id,
+                f" Missing after update would remain: {', '.join(item['missing_admin_fields'])}"
+                if item["missing_admin_fields"]
+                else "",
+            )
+            items.append(item)
+            continue
+
         try:
             update_response = zoho_client.update_quote_fields(record.quote_id, update_values)
         except ZohoApiError as exc:
@@ -1931,6 +1969,119 @@ def sync_quote_regions(
     )
 
 
+def _finalize_staged_run_updates(
+    zoho_client: ZohoCrmClient,
+    sync_payload: dict[str, Any],
+    region_payload: dict[str, Any],
+) -> None:
+    logger = zoho_client.logger
+    sync_items = {
+        str(item.get("quote_id")): item
+        for item in sync_payload.get("items", [])
+        if item.get("quote_id")
+    }
+    region_items = {
+        str(item.get("quote_id")): item
+        for item in region_payload.get("items", [])
+        if item.get("quote_id")
+    }
+    ordered_quote_ids = _ordered_quote_ids(sync_payload, region_payload)
+    sync_summary = sync_payload.get("summary") or {}
+    region_summary = region_payload.get("summary") or {}
+
+    for quote_id in ordered_quote_ids:
+        sync_item = sync_items.get(quote_id)
+        region_item = region_items.get(quote_id)
+        sync_staged = bool(sync_item and sync_item.get("status") == "staged_coordinate_update")
+        region_staged = bool(
+            region_item and region_item.get("status") in {"staged_boundary_update", "staged_boundary_partial"}
+        )
+
+        combined_values: dict[str, Any] = {}
+        coordinate_values: dict[str, Any] = {}
+        admin_values: dict[str, Any] = {}
+
+        if sync_staged:
+            raw_coordinates = sync_item.get("coordinate_update_values") or {}
+            try:
+                coordinate_values = _coordinate_field_values(
+                    zoho_client.field_config,
+                    float(raw_coordinates["latitude"]),
+                    float(raw_coordinates["longitude"]),
+                )
+            except (ConfigError, KeyError, TypeError, ValueError) as exc:
+                sync_item["status"] = "update_error"
+                sync_item["status_reason"] = "The final combined Zoho update could not prepare latitude/longitude values."
+                sync_item["error"] = str(exc)
+                sync_summary["update_errors"] = sync_summary.get("update_errors", 0) + 1
+                logger.warning(
+                    "Quote %s could not prepare staged latitude/longitude values for final CRM update: %s",
+                    quote_id,
+                    exc,
+                )
+                sync_staged = False
+            else:
+                combined_values.update(coordinate_values)
+
+        if region_staged:
+            admin_values = dict(region_item.get("admin_update_values") or {})
+            combined_values.update(admin_values)
+
+        if sync_item and (coordinate_values or admin_values):
+            sync_item["final_combined_update_values"] = dict(combined_values)
+        if region_item and (coordinate_values or admin_values):
+            region_item["final_combined_update_values"] = dict(combined_values)
+
+        if not combined_values:
+            if region_item and sync_item and sync_item.get("status") in {"updated", "update_error"}:
+                region_item["coordinate_source_sync_status"] = sync_item.get("status")
+            continue
+
+        try:
+            update_response = zoho_client.update_quote_fields(quote_id, combined_values)
+        except ZohoApiError as exc:
+            if sync_staged and sync_item:
+                sync_item["status"] = "update_error"
+                sync_item["status_reason"] = "Zoho CRM rejected the final combined quote update."
+                sync_item["error"] = str(exc)
+                sync_summary["update_errors"] = sync_summary.get("update_errors", 0) + 1
+            if region_staged and region_item:
+                region_item["status"] = "update_error"
+                region_item["status_reason"] = "Zoho CRM rejected the final combined quote update."
+                region_item["error"] = str(exc)
+                region_summary["update_errors"] = region_summary.get("update_errors", 0) + 1
+            logger.warning("Quote %s final combined update failed: %s", quote_id, exc)
+            continue
+
+        if sync_staged and sync_item:
+            sync_item["status"] = "updated"
+            sync_item["status_reason"] = "Latitude and longitude were updated in Zoho CRM at the end of the run."
+            sync_item["update_response"] = update_response
+            sync_summary["updated"] = sync_summary.get("updated", 0) + 1
+
+        if region_staged and region_item:
+            region_item["status"] = "updated_partial" if region_item.get("missing_admin_fields") else "updated"
+            region_item["status_reason"] = (
+                "Boundary fields were updated at the end of the run, but one or more requested fields are still unresolved."
+                if region_item.get("missing_admin_fields")
+                else "All requested boundary fields were updated in Zoho CRM at the end of the run."
+            )
+            region_item["update_response"] = update_response
+            if region_item.get("missing_admin_fields"):
+                region_summary["updated_partial"] = region_summary.get("updated_partial", 0) + 1
+            else:
+                region_summary["updated"] = region_summary.get("updated", 0) + 1
+
+        if region_item and sync_item and sync_item.get("status") in {"updated", "update_error"}:
+            region_item["coordinate_source_sync_status"] = sync_item.get("status")
+
+        logger.info(
+            "Quote %s final CRM update applied with %s field(s).",
+            quote_id,
+            len(combined_values),
+        )
+
+
 def run_quote_enrichment(
     zoho_client: ZohoCrmClient,
     geocoder: GoogleGeocoder,
@@ -1947,6 +2098,7 @@ def run_quote_enrichment(
         zoho_client,
         geocoder,
         skip_existing=skip_existing,
+        apply_updates=False,
     )
     region_payload = _process_quote_region_sync(
         records,
@@ -1955,11 +2107,21 @@ def run_quote_enrichment(
         arrond_resolver=arrond_resolver,
         update_existing=update_existing_region,
         coordinate_contexts=coordinate_contexts,
+        apply_updates=False,
     )
-    return _build_run_report(
+    _finalize_staged_run_updates(zoho_client, sync_payload, region_payload)
+    payload = _build_run_report(
         sync_payload=sync_payload,
         region_payload=region_payload,
     )
+    payload.setdefault("meta", {})
+    payload["meta"]["crm_update_strategy"] = "deferred_single_put_per_quote"
+    payload.setdefault("summary_lines", [])
+    payload["summary_lines"].insert(
+        0,
+        "The run command staged every geocode and boundary result first, then attempted one final Zoho update per quote using all successful values.",
+    )
+    return payload
 
 
 def build_parser() -> argparse.ArgumentParser:
