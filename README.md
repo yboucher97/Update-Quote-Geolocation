@@ -19,9 +19,13 @@ It still also supports the lower-level jobs:
   Main application. Commands:
   - `fetch`: export quote IDs and shipping address fields
   - `run`: do the full end-to-end quote enrichment in one command and write one consolidated workbook
+  - `run-one`: do the same end-to-end enrichment for exactly one quote ID
   - `sync`: geocode shipping addresses and update quote latitude/longitude
   - `region-sync`: resolve arrondissement, municipality, MRC, and region from shapefiles and update CRM fields
   - `report`: merge `sync` and `region-sync` JSON outputs into one readable Excel run report
+
+- `quote_geolocation_webhook.py`
+  FastAPI app that accepts a `quote_id` via webhook, fetches that quote from Zoho CRM, geocodes its address, resolves Region/MRC/Muni/Arrondissement, and updates only that quote.
 
 - `zoho_quote_geocode.env.example`
   Template config file. This shows where to put Zoho OAuth details, Google API key, Zoho field API names, and shapefile paths.
@@ -54,6 +58,8 @@ The package installs:
 - app code under `/usr/lib/update-quote-geolocation/`
 - example config under `/etc/update-quote-geolocation/zoho_quote_geocode.env.example`
 - working config under `/etc/update-quote-geolocation/zoho_quote_geocode.env`
+- CLI wrapper at `/usr/bin/update-quote-geolocation`
+- webhook runner at `/usr/bin/update-quote-geolocation-webhook`
 
 The command automatically loads configuration from:
 
@@ -145,6 +151,18 @@ These variables are the Zoho auth and connection settings:
 
 - `ZOHO_QUOTE_RUN_REPORT_PATH`
   Default Excel output path for the one-command `run` workbook.
+
+- `ZOHO_QUOTE_RUN_ONE_REPORT_PATH`
+  Default Excel output path for the one-quote `run-one` workbook.
+
+- `ZOHO_QUOTE_WEBHOOK_SECRET`
+  Optional shared secret. If set, webhook callers must send it in the `X-Webhook-Secret` header.
+
+- `ZOHO_QUOTE_WEBHOOK_HOST`
+  Bind address for the standalone FastAPI webhook runner.
+
+- `ZOHO_QUOTE_WEBHOOK_PORT`
+  Port for the standalone FastAPI webhook runner.
 
 ## Where To Change Zoho Field Names
 
@@ -317,6 +335,15 @@ update-quote-geolocation run \
 
 The remaining commands are still available for debugging or partial reruns.
 
+Run the same end-to-end flow for exactly one quote:
+
+```bash
+update-quote-geolocation run-one \
+  --quote-id 4143382000212414002 \
+  --report-output single-quote-run-report.xlsx \
+  --output single-quote-run-report.json
+```
+
 Fetch quotes and shipping address fields:
 
 ```bash
@@ -379,6 +406,63 @@ update-quote-geolocation report \
   --json-output live-5-run-report.json
 ```
 
+## Webhook Endpoint
+
+Run the standalone webhook service on the VM:
+
+```bash
+update-quote-geolocation-webhook
+```
+
+By default it listens on:
+
+```text
+127.0.0.1:8050
+```
+
+You can change that in `/etc/update-quote-geolocation/zoho_quote_geocode.env` with:
+
+```env
+ZOHO_QUOTE_WEBHOOK_HOST=127.0.0.1
+ZOHO_QUOTE_WEBHOOK_PORT=8050
+ZOHO_QUOTE_WEBHOOK_SECRET=your_shared_secret
+```
+
+Webhook request:
+
+```http
+POST /webhooks/quote-geolocation
+Content-Type: application/json
+X-Webhook-Secret: your_shared_secret
+
+{
+  "quote_id": "4143382000212414002"
+}
+```
+
+Optional JSON body flags:
+
+- `update_existing`
+- `update_existing_region`
+
+Health check:
+
+```http
+GET /health
+```
+
+Example Caddy route:
+
+```caddyfile
+handle /webhooks/quote-geolocation* {
+    reverse_proxy 127.0.0.1:8050
+}
+
+handle /health {
+    reverse_proxy 127.0.0.1:8050
+}
+```
+
 ## Excel Failure Reports
 
 `sync` writes an Excel report for quotes with missing shipping fields, geocoding failures, or CRM update failures.
@@ -435,6 +519,8 @@ The JSON output now includes:
 - `sync` now logs one line per quote explaining whether it was updated, skipped, or failed.
 - `run` is the recommended command when you want one live pass and one readable workbook.
 - `run` stages all geocode and boundary results first, then attempts one final Zoho `PUT` per quote using every field that succeeded for that quote.
+- `run-one` uses the same logic, but fetches and updates only the quote ID you provide.
+- `update-quote-geolocation-webhook` exposes the `run-one` behavior over FastAPI for Zoho webhooks or other HTTP callers.
 - `report` is the best file to review when you already have separate JSON logs and want one readable explanation of the whole run.
 - With refresh-token auth, the script uses Zoho's returned `api_domain` automatically.
 - Coordinate values are rounded before update so they fit Zoho decimal field limits more reliably.

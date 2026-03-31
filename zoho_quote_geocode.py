@@ -606,6 +606,17 @@ class ZohoCrmClient:
 
         return records
 
+    def fetch_quote_with_shipping_address(self, quote_id: str) -> QuoteAddressRecord:
+        payload = self._request(
+            "GET",
+            f"{self.config.api_base_url}/{self.config.module_api_name}/{quote_id}",
+            params={"fields": ",".join(self.field_config.requested_fields())},
+        )
+        data = payload.get("data") or []
+        if not data:
+            raise ConfigError(f"Quote was not found in Zoho CRM: {quote_id}")
+        return QuoteAddressRecord.from_zoho_record(data[0], self.field_config)
+
     def update_quote_coordinates(self, quote_id: str, latitude: float, longitude: float) -> dict[str, Any]:
         return self.update_quote_fields(
             quote_id,
@@ -759,6 +770,13 @@ def fetch_quote_shipping_addresses(
     max_records: int | None = None,
 ) -> list[QuoteAddressRecord]:
     return zoho_client.fetch_quotes_with_shipping_addresses(max_records=max_records)
+
+
+def fetch_quote_shipping_address(
+    zoho_client: ZohoCrmClient,
+    quote_id: str,
+) -> QuoteAddressRecord:
+    return zoho_client.fetch_quote_with_shipping_address(quote_id)
 
 
 def _build_record_item(record: QuoteAddressRecord, fields: QuoteFieldConfig) -> dict[str, Any]:
@@ -2082,17 +2100,17 @@ def _finalize_staged_run_updates(
         )
 
 
-def run_quote_enrichment(
+def _run_quote_enrichment_for_records(
     zoho_client: ZohoCrmClient,
     geocoder: GoogleGeocoder,
     resolvers: list[RegionShapeResolver],
+    records: list[QuoteAddressRecord],
     *,
+    command_label: str,
     arrond_resolver: RegionShapeResolver | None = None,
-    max_records: int | None = None,
     skip_existing: bool = True,
     update_existing_region: bool = False,
 ) -> dict[str, Any]:
-    records = fetch_quote_shipping_addresses(zoho_client, max_records=max_records)
     sync_payload, coordinate_contexts = _process_quote_coordinate_sync(
         records,
         zoho_client,
@@ -2119,8 +2137,57 @@ def run_quote_enrichment(
     payload.setdefault("summary_lines", [])
     payload["summary_lines"].insert(
         0,
-        "The run command staged every geocode and boundary result first, then attempted one final Zoho update per quote using all successful values.",
+        f"The {command_label} command staged every geocode and boundary result first, then attempted one final Zoho update per quote using all successful values.",
     )
+    return payload
+
+
+def run_quote_enrichment(
+    zoho_client: ZohoCrmClient,
+    geocoder: GoogleGeocoder,
+    resolvers: list[RegionShapeResolver],
+    *,
+    arrond_resolver: RegionShapeResolver | None = None,
+    max_records: int | None = None,
+    skip_existing: bool = True,
+    update_existing_region: bool = False,
+) -> dict[str, Any]:
+    records = fetch_quote_shipping_addresses(zoho_client, max_records=max_records)
+    return _run_quote_enrichment_for_records(
+        zoho_client,
+        geocoder,
+        resolvers,
+        records,
+        command_label="run",
+        arrond_resolver=arrond_resolver,
+        skip_existing=skip_existing,
+        update_existing_region=update_existing_region,
+    )
+
+
+def run_single_quote_enrichment(
+    zoho_client: ZohoCrmClient,
+    geocoder: GoogleGeocoder,
+    resolvers: list[RegionShapeResolver],
+    quote_id: str,
+    *,
+    arrond_resolver: RegionShapeResolver | None = None,
+    skip_existing: bool = True,
+    update_existing_region: bool = False,
+) -> dict[str, Any]:
+    record = fetch_quote_shipping_address(zoho_client, quote_id)
+    payload = _run_quote_enrichment_for_records(
+        zoho_client,
+        geocoder,
+        resolvers,
+        [record],
+        command_label="run-one",
+        arrond_resolver=arrond_resolver,
+        skip_existing=skip_existing,
+        update_existing_region=update_existing_region,
+    )
+    payload.setdefault("meta", {})
+    payload["meta"]["quote_id"] = quote_id
     return payload
 
 
@@ -2137,6 +2204,10 @@ def build_parser() -> argparse.ArgumentParser:
         "run",
         help="Fetch once, geocode addresses, update coordinates, resolve boundaries, and write one consolidated report.",
     )
+    run_one_parser = subparsers.add_parser(
+        "run-one",
+        help="Process one quote by ID end-to-end and write one consolidated report.",
+    )
     region_parser = subparsers.add_parser(
         "region-sync",
         help="Use quote latitude/longitude to resolve arrondissement, municipality, MRC, and region polygons and update quote fields.",
@@ -2146,7 +2217,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Combine sync and region-sync JSON outputs into one readable Excel report.",
     )
 
-    for current_parser in (fetch_parser, sync_parser, run_parser, region_parser):
+    for current_parser in (fetch_parser, sync_parser, run_parser, run_one_parser, region_parser):
         current_parser.add_argument(
             "--api-base-url",
             default=_read_env("ZOHO_CRM_API_BASE_URL", default="https://www.zohoapis.com/crm/v7"),
@@ -2234,7 +2305,7 @@ def build_parser() -> argparse.ArgumentParser:
             help="Log level.",
         )
 
-    for geocode_parser in (sync_parser, run_parser):
+    for geocode_parser in (sync_parser, run_parser, run_one_parser):
         geocode_parser.add_argument(
             "--google-api-key",
             default=_read_env("GOOGLE_MAPS_API_KEY", "GOOGLE_GEOCODING_API_KEY"),
@@ -2276,7 +2347,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Excel report path for quotes where Google geocoding returned ZERO_RESULTS or an API error.",
     )
 
-    for region_target_parser in (sync_parser, run_parser, region_parser):
+    for region_target_parser in (sync_parser, run_parser, run_one_parser, region_parser):
         region_target_parser.add_argument(
             "--latitude-field",
             default=_read_env("ZOHO_QUOTE_LATITUDE_FIELD"),
@@ -2288,7 +2359,7 @@ def build_parser() -> argparse.ArgumentParser:
             help="Longitude field API name in the quote module.",
         )
 
-    for boundary_parser in (run_parser, region_parser):
+    for boundary_parser in (run_parser, run_one_parser, region_parser):
         boundary_parser.add_argument(
             "--region-name-field",
             default=_read_env("ZOHO_QUOTE_REGION_NAME_FIELD"),
@@ -2424,6 +2495,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path(_read_env("ZOHO_QUOTE_RUN_REPORT_PATH", default="quote-run-report.xlsx") or "quote-run-report.xlsx"),
         help="Path to the consolidated Excel report written by the run command.",
+    )
+    run_one_parser.add_argument(
+        "--quote-id",
+        required=True,
+        help="Zoho quote record ID to process.",
+    )
+    run_one_parser.add_argument(
+        "--report-output",
+        type=Path,
+        default=Path(_read_env("ZOHO_QUOTE_RUN_ONE_REPORT_PATH", default="quote-run-one-report.xlsx") or "quote-run-one-report.xlsx"),
+        help="Path to the consolidated Excel report written by the run-one command.",
     )
 
     report_parser.add_argument(
@@ -2622,10 +2704,10 @@ def main(argv: list[str] | None = None) -> int:
                         skip_existing=not args.update_existing,
                         dry_run=args.dry_run,
                     )
-            elif args.command == "run":
+            elif args.command in {"run", "run-one"}:
                 if not args.google_api_key:
                     raise ConfigError(
-                        "Google API key is required for run mode. Set GOOGLE_MAPS_API_KEY or pass --google-api-key."
+                        f"Google API key is required for {args.command} mode. Set GOOGLE_MAPS_API_KEY or pass --google-api-key."
                     )
 
                 region_configs = _build_region_lookup_configs(args)
@@ -2640,15 +2722,26 @@ def main(argv: list[str] | None = None) -> int:
                     with ExitStack() as stack:
                         resolvers = [stack.enter_context(RegionShapeResolver(config, logger)) for config in region_configs]
                         arrond_resolver = stack.enter_context(RegionShapeResolver(arrond_config, logger)) if arrond_config else None
-                        payload = run_quote_enrichment(
-                            zoho_client,
-                            geocoder,
-                            resolvers,
-                            arrond_resolver=arrond_resolver,
-                            max_records=args.max_records,
-                            skip_existing=not args.update_existing,
-                            update_existing_region=args.update_existing_region,
-                        )
+                        if args.command == "run":
+                            payload = run_quote_enrichment(
+                                zoho_client,
+                                geocoder,
+                                resolvers,
+                                arrond_resolver=arrond_resolver,
+                                max_records=args.max_records,
+                                skip_existing=not args.update_existing,
+                                update_existing_region=args.update_existing_region,
+                            )
+                        else:
+                            payload = run_single_quote_enrichment(
+                                zoho_client,
+                                geocoder,
+                                resolvers,
+                                args.quote_id,
+                                arrond_resolver=arrond_resolver,
+                                skip_existing=not args.update_existing,
+                                update_existing_region=args.update_existing_region,
+                            )
             else:
                 region_configs = _build_region_lookup_configs(args)
                 arrond_config = _build_arrond_lookup_config(args)
@@ -2680,7 +2773,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     payload["meta"] = meta
 
-    if args.command == "run":
+    if args.command in {"run", "run-one"}:
         try:
             report_path = _write_run_report(args.report_output, payload, logger)
         except ConfigError as exc:
