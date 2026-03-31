@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import logging
 import os
@@ -107,13 +108,26 @@ def _coerce_float(value: Any) -> float | None:
         return None
 
 
+def _json_default(value: Any) -> Any:
+    if isinstance(value, (dt.date, dt.datetime, dt.time)):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Decimal):
+        return float(value)
+    return str(value)
+
+
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False, default=_json_default),
+        encoding="utf-8",
+    )
 
 
 def _json_string(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False) if value is not None else ""
+    return json.dumps(value, ensure_ascii=False, default=_json_default) if value is not None else ""
 
 
 def _normalize_coordinate(value: float, decimal_places: int, max_length: int) -> float:
@@ -1564,7 +1578,7 @@ def main(argv: list[str] | None = None) -> int:
         _write_json(args.output, payload)
         logger.info("Wrote JSON output to %s", args.output)
     else:
-        json.dump(payload, sys.stdout, indent=2, ensure_ascii=False)
+        json.dump(payload, sys.stdout, indent=2, ensure_ascii=False, default=_json_default)
         sys.stdout.write("\n")
 
     if args.command in {"sync", "region-sync"}:
