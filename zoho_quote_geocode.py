@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -160,6 +161,8 @@ class QuoteFieldConfig:
     longitude_field: str | None
     region_name_field: str | None
     region_code_field: str | None
+    mrc_name_field: str | None
+    muni_name_field: str | None
     coordinate_decimal_places: int
     coordinate_max_length: int
 
@@ -179,6 +182,10 @@ class QuoteFieldConfig:
             fields.append(self.region_name_field)
         if self.region_code_field:
             fields.append(self.region_code_field)
+        if self.mrc_name_field:
+            fields.append(self.mrc_name_field)
+        if self.muni_name_field:
+            fields.append(self.muni_name_field)
         seen: set[str] = set()
         ordered: list[str] = []
         for field_name in fields:
@@ -200,6 +207,8 @@ class QuoteAddressRecord:
     current_longitude: float | None
     current_region_name: str | None
     current_region_code: str | None
+    current_mrc_name: str | None
+    current_muni_name: str | None
     address_fields: dict[str, Any]
 
     @classmethod
@@ -219,6 +228,10 @@ class QuoteAddressRecord:
             address_fields[fields.region_name_field] = record.get(fields.region_name_field)
         if fields.region_code_field:
             address_fields[fields.region_code_field] = record.get(fields.region_code_field)
+        if fields.mrc_name_field:
+            address_fields[fields.mrc_name_field] = record.get(fields.mrc_name_field)
+        if fields.muni_name_field:
+            address_fields[fields.muni_name_field] = record.get(fields.muni_name_field)
 
         return cls(
             quote_id=str(record["id"]),
@@ -231,6 +244,8 @@ class QuoteAddressRecord:
             current_longitude=_coerce_float(record.get(fields.longitude_field)) if fields.longitude_field else None,
             current_region_name=_clean_text(record.get(fields.region_name_field)) if fields.region_name_field else None,
             current_region_code=_clean_text(record.get(fields.region_code_field)) if fields.region_code_field else None,
+            current_mrc_name=_clean_text(record.get(fields.mrc_name_field)) if fields.mrc_name_field else None,
+            current_muni_name=_clean_text(record.get(fields.muni_name_field)) if fields.muni_name_field else None,
             address_fields=address_fields,
         )
 
@@ -272,21 +287,29 @@ class QuoteAddressRecord:
             "current_longitude": self.current_longitude,
             "current_region_name": self.current_region_name,
             "current_region_code": self.current_region_code,
+            "current_mrc_name": self.current_mrc_name,
+            "current_muni_name": self.current_muni_name,
             "address_fields": self.address_fields,
         }
 
 
 @dataclass(slots=True)
 class RegionLookupConfig:
+    source_label: str
     shape_path: Path
     region_name_attribute: str
     region_code_attribute: str | None
+    mrc_name_attribute: str | None = None
+    muni_name_attribute: str | None = None
 
 
 @dataclass(slots=True)
 class RegionMatch:
+    source_label: str
     name: str | None
     code: str | None
+    mrc_name: str | None
+    muni_name: str | None
     attributes: dict[str, Any]
 
 
@@ -374,6 +397,8 @@ class RegionShapeResolver:
         self.fields = [field[0] for field in self.reader.fields[1:]]
         self.name_index = self._field_index(config.region_name_attribute)
         self.code_index = self._field_index(config.region_code_attribute) if config.region_code_attribute else None
+        self.mrc_index = self._field_index(config.mrc_name_attribute) if config.mrc_name_attribute else None
+        self.muni_index = self._field_index(config.muni_name_attribute) if config.muni_name_attribute else None
         self.records = list(self.reader.iterShapeRecords())
 
     def __enter__(self) -> "RegionShapeResolver":
@@ -405,7 +430,24 @@ class RegionShapeResolver:
                     if self.code_index is not None
                     else None
                 )
-                return RegionMatch(name=name, code=code, attributes=attributes)
+                mrc_name = (
+                    _clean_text(record_values[self.mrc_index])
+                    if self.mrc_index is not None
+                    else None
+                )
+                muni_name = (
+                    _clean_text(record_values[self.muni_index])
+                    if self.muni_index is not None
+                    else None
+                )
+                return RegionMatch(
+                    source_label=self.config.source_label,
+                    name=name,
+                    code=code,
+                    mrc_name=mrc_name,
+                    muni_name=muni_name,
+                    attributes=attributes,
+                )
 
         return None
 
@@ -695,10 +737,43 @@ def _build_record_item(record: QuoteAddressRecord, fields: QuoteFieldConfig) -> 
     return item
 
 
+def _admin_target_specs(
+    record: QuoteAddressRecord,
+    fields: QuoteFieldConfig,
+    match: RegionMatch | None = None,
+) -> list[tuple[str, str | None, str | None]]:
+    specs: list[tuple[str, str | None, str | None]] = []
+    if fields.region_name_field:
+        specs.append((fields.region_name_field, record.current_region_name, match.name if match else None))
+    if fields.region_code_field:
+        specs.append((fields.region_code_field, record.current_region_code, match.code if match else None))
+    if fields.mrc_name_field:
+        specs.append((fields.mrc_name_field, record.current_mrc_name, match.mrc_name if match else None))
+    if fields.muni_name_field:
+        specs.append((fields.muni_name_field, record.current_muni_name, match.muni_name if match else None))
+    return specs
+
+
+def _remaining_admin_fields(
+    record: QuoteAddressRecord,
+    fields: QuoteFieldConfig,
+    update_values: dict[str, Any] | None = None,
+) -> list[str]:
+    effective_updates = update_values or {}
+    missing_fields: list[str] = []
+    for field_name, current_value, _ in _admin_target_specs(record, fields):
+        final_value = effective_updates.get(field_name, current_value)
+        if not _clean_text(final_value):
+            missing_fields.append(field_name)
+    return missing_fields
+
+
 def _should_include_in_failure_report(item: dict[str, Any]) -> bool:
     if item.get("missing_shipping_fields"):
         return True
     if item.get("missing_coordinate_fields"):
+        return True
+    if item.get("missing_admin_fields"):
         return True
     return item.get("status") in {
         "skipped_missing_address",
@@ -707,6 +782,7 @@ def _should_include_in_failure_report(item: dict[str, Any]) -> bool:
         "geocode_error",
         "region_lookup_error",
         "no_region_match",
+        "no_admin_update_values",
         "update_error",
     }
 
@@ -739,6 +815,8 @@ def _write_failure_report(path: Path, payload: dict[str, Any], logger: logging.L
         "quote_id",
         "status",
         "missing_shipping_fields",
+        "missing_coordinate_fields",
+        "missing_admin_fields",
         "formatted_address",
         "shipping_street",
         "shipping_city",
@@ -749,6 +827,8 @@ def _write_failure_report(path: Path, payload: dict[str, Any], logger: logging.L
         "current_longitude",
         "current_region_name",
         "current_region_code",
+        "current_mrc_name",
+        "current_muni_name",
         "geocoded_latitude",
         "geocoded_longitude",
         "geocoded_formatted_address",
@@ -756,6 +836,9 @@ def _write_failure_report(path: Path, payload: dict[str, Any], logger: logging.L
         "geocode_location_type",
         "resolved_region_name",
         "resolved_region_code",
+        "resolved_mrc_name",
+        "resolved_muni_name",
+        "region_match_source",
         "error",
         "raw_address_fields",
         "update_response",
@@ -771,6 +854,8 @@ def _write_failure_report(path: Path, payload: dict[str, Any], logger: logging.L
                 item.get("quote_id", ""),
                 item.get("status", ""),
                 ", ".join(item.get("missing_shipping_fields") or []),
+                ", ".join(item.get("missing_coordinate_fields") or []),
+                ", ".join(item.get("missing_admin_fields") or []),
                 item.get("formatted_address", ""),
                 item.get("shipping_street", ""),
                 item.get("shipping_city", ""),
@@ -781,6 +866,8 @@ def _write_failure_report(path: Path, payload: dict[str, Any], logger: logging.L
                 item.get("current_longitude", ""),
                 item.get("current_region_name", ""),
                 item.get("current_region_code", ""),
+                item.get("current_mrc_name", ""),
+                item.get("current_muni_name", ""),
                 geocode.get("latitude", ""),
                 geocode.get("longitude", ""),
                 geocode.get("formatted_address", ""),
@@ -788,6 +875,9 @@ def _write_failure_report(path: Path, payload: dict[str, Any], logger: logging.L
                 geocode.get("location_type", ""),
                 item.get("resolved_region_name", ""),
                 item.get("resolved_region_code", ""),
+                item.get("resolved_mrc_name", ""),
+                item.get("resolved_muni_name", ""),
+                item.get("region_match_source", ""),
                 item.get("error", ""),
                 _json_string(item.get("address_fields")),
                 _json_string(item.get("update_response")),
@@ -929,7 +1019,7 @@ def sync_quote_coordinates(
 
 def sync_quote_regions(
     zoho_client: ZohoCrmClient,
-    resolver: RegionShapeResolver,
+    resolvers: list[RegionShapeResolver],
     *,
     max_records: int | None = None,
     update_existing: bool = False,
@@ -939,26 +1029,40 @@ def sync_quote_regions(
             "Latitude and longitude field API names are required for region sync. "
             "Set ZOHO_QUOTE_LATITUDE_FIELD and ZOHO_QUOTE_LONGITUDE_FIELD."
         )
-    if not zoho_client.field_config.region_name_field and not zoho_client.field_config.region_code_field:
+    if not any(
+        [
+            zoho_client.field_config.region_name_field,
+            zoho_client.field_config.region_code_field,
+            zoho_client.field_config.mrc_name_field,
+            zoho_client.field_config.muni_name_field,
+        ]
+    ):
         raise ConfigError(
-            "At least one region target field is required for region sync. "
-            "Set ZOHO_QUOTE_REGION_NAME_FIELD and/or ZOHO_QUOTE_REGION_CODE_FIELD."
+            "At least one admin-boundary target field is required for region sync. "
+            "Set one or more of ZOHO_QUOTE_REGION_NAME_FIELD, ZOHO_QUOTE_REGION_CODE_FIELD, "
+            "ZOHO_QUOTE_MRC_NAME_FIELD, or ZOHO_QUOTE_MUNI_NAME_FIELD."
         )
 
     records = fetch_quote_shipping_addresses(zoho_client, max_records=max_records)
     summary = {
         "fetched": len(records),
         "updated": 0,
+        "updated_partial": 0,
         "skipped_missing_coordinates": 0,
-        "skipped_existing_region": 0,
+        "skipped_existing_admin_fields": 0,
         "no_region_match": 0,
+        "no_admin_update_values": 0,
         "region_lookup_errors": 0,
         "update_errors": 0,
+        "matched_by_muni": 0,
+        "matched_by_mrc": 0,
+        "matched_by_region": 0,
     }
     items: list[dict[str, Any]] = []
 
     for record in records:
         item = _build_record_item(record, zoho_client.field_config)
+        item["missing_admin_fields"] = _remaining_admin_fields(record, zoho_client.field_config)
 
         if record.current_latitude is None or record.current_longitude is None:
             item["status"] = "skipped_missing_coordinates"
@@ -966,20 +1070,20 @@ def sync_quote_regions(
             items.append(item)
             continue
 
-        if (
-            not update_existing
-            and (
-                (zoho_client.field_config.region_name_field and record.current_region_name)
-                or (zoho_client.field_config.region_code_field and record.current_region_code)
-            )
-        ):
-            item["status"] = "skipped_existing_region"
-            summary["skipped_existing_region"] += 1
+        configured_admin_targets = _admin_target_specs(record, zoho_client.field_config)
+        if not update_existing and configured_admin_targets and all(current_value for _, current_value, _ in configured_admin_targets):
+            item["status"] = "skipped_existing_admin_fields"
+            item["missing_admin_fields"] = []
+            summary["skipped_existing_admin_fields"] += 1
             items.append(item)
             continue
 
         try:
-            match = resolver.lookup(record.current_longitude, record.current_latitude)
+            match = None
+            for resolver in resolvers:
+                match = resolver.lookup(record.current_longitude, record.current_latitude)
+                if match is not None:
+                    break
         except Exception as exc:  # pragma: no cover - unexpected shape parsing/runtime failure
             item["status"] = "region_lookup_error"
             item["error"] = str(exc)
@@ -989,19 +1093,38 @@ def sync_quote_regions(
 
         if match is None:
             item["status"] = "no_region_match"
+            item["missing_admin_fields"] = _remaining_admin_fields(record, zoho_client.field_config)
             summary["no_region_match"] += 1
             items.append(item)
             continue
 
+        item["region_match_source"] = match.source_label
         item["resolved_region_name"] = match.name
         item["resolved_region_code"] = match.code
+        item["resolved_mrc_name"] = match.mrc_name
+        item["resolved_muni_name"] = match.muni_name
         item["resolved_region_attributes"] = match.attributes
+        if match.source_label == "municipality":
+            summary["matched_by_muni"] += 1
+        elif match.source_label == "mrc":
+            summary["matched_by_mrc"] += 1
+        else:
+            summary["matched_by_region"] += 1
 
         update_values: dict[str, Any] = {}
-        if zoho_client.field_config.region_name_field:
-            update_values[zoho_client.field_config.region_name_field] = match.name or ""
-        if zoho_client.field_config.region_code_field:
-            update_values[zoho_client.field_config.region_code_field] = match.code or ""
+        for field_name, current_value, resolved_value in _admin_target_specs(record, zoho_client.field_config, match):
+            if not resolved_value:
+                continue
+            if update_existing or not current_value:
+                update_values[field_name] = resolved_value
+
+        item["missing_admin_fields"] = _remaining_admin_fields(record, zoho_client.field_config, update_values)
+
+        if not update_values:
+            item["status"] = "no_admin_update_values"
+            summary["no_admin_update_values"] += 1
+            items.append(item)
+            continue
 
         try:
             update_response = zoho_client.update_quote_fields(record.quote_id, update_values)
@@ -1012,9 +1135,12 @@ def sync_quote_regions(
             items.append(item)
             continue
 
-        item["status"] = "updated"
+        item["status"] = "updated_partial" if item["missing_admin_fields"] else "updated"
         item["update_response"] = update_response
-        summary["updated"] += 1
+        if item["missing_admin_fields"]:
+            summary["updated_partial"] += 1
+        else:
+            summary["updated"] += 1
         items.append(item)
 
     return {
@@ -1025,7 +1151,7 @@ def sync_quote_regions(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Fetch Zoho CRM quotes, geocode shipping addresses with Google, and update latitude/longitude."
+        description="Fetch Zoho CRM quotes, geocode shipping addresses, and enrich quotes with boundary fields."
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1034,7 +1160,7 @@ def build_parser() -> argparse.ArgumentParser:
     sync_parser = subparsers.add_parser("sync", help="Fetch quotes, geocode shipping addresses, and update CRM.")
     region_parser = subparsers.add_parser(
         "region-sync",
-        help="Use quote latitude/longitude to resolve a polygon from a shapefile and update quote region fields.",
+        help="Use quote latitude/longitude to resolve municipality, MRC, and region polygons and update quote fields.",
     )
 
     for current_parser in (fetch_parser, sync_parser, region_parser):
@@ -1182,31 +1308,106 @@ def build_parser() -> argparse.ArgumentParser:
         help="Zoho quote field API name to update with the matched region code.",
     )
     region_parser.add_argument(
+        "--mrc-name-field",
+        default=_read_env("ZOHO_QUOTE_MRC_NAME_FIELD"),
+        help="Zoho quote field API name to update with the matched MRC name.",
+    )
+    region_parser.add_argument(
+        "--muni-name-field",
+        default=_read_env("ZOHO_QUOTE_MUNI_NAME_FIELD"),
+        help="Zoho quote field API name to update with the matched municipality name.",
+    )
+    region_parser.add_argument(
+        "--muni-shape-path",
+        type=Path,
+        default=Path(_read_env("ZOHO_MUNI_SHAPE_PATH")) if _read_env("ZOHO_MUNI_SHAPE_PATH") else None,
+        help="Primary municipality shapefile (.shp) path.",
+    )
+    region_parser.add_argument(
+        "--muni-name-attribute",
+        default=_read_env("ZOHO_MUNI_NAME_ATTRIBUTE", default="MUS_NM_MUN"),
+        help="Municipality shapefile attribute that contains the municipality name.",
+    )
+    region_parser.add_argument(
+        "--muni-mrc-attribute",
+        default=_read_env("ZOHO_MUNI_MRC_ATTRIBUTE", default="MUS_NM_MRC"),
+        help="Municipality shapefile attribute that contains the MRC name.",
+    )
+    region_parser.add_argument(
+        "--muni-region-attribute",
+        default=_read_env("ZOHO_MUNI_REGION_ATTRIBUTE", default="MUS_NM_REG"),
+        help="Municipality shapefile attribute that contains the region name.",
+    )
+    region_parser.add_argument(
+        "--muni-region-code-attribute",
+        default=_read_env("ZOHO_MUNI_REGION_CODE_ATTRIBUTE", default="MUS_CO_REG"),
+        help="Municipality shapefile attribute that contains the region code.",
+    )
+    region_parser.add_argument(
+        "--mrc-shape-path",
+        type=Path,
+        default=Path(_read_env("ZOHO_MRC_SHAPE_PATH", "ZOHO_REGION_FALLBACK_SHAPE_PATH"))
+        if _read_env("ZOHO_MRC_SHAPE_PATH", "ZOHO_REGION_FALLBACK_SHAPE_PATH")
+        else None,
+        help="Fallback MRC shapefile (.shp) path.",
+    )
+    region_parser.add_argument(
+        "--mrc-name-attribute",
+        default=_read_env("ZOHO_MRC_NAME_ATTRIBUTE", default="MRS_NM_MRC"),
+        help="MRC shapefile attribute that contains the MRC name.",
+    )
+    region_parser.add_argument(
+        "--mrc-region-attribute",
+        default=_read_env("ZOHO_MRC_REGION_ATTRIBUTE", "ZOHO_REGION_FALLBACK_NAME_ATTRIBUTE", default="MRS_NM_REG"),
+        help="MRC shapefile attribute that contains the region name.",
+    )
+    region_parser.add_argument(
+        "--mrc-region-code-attribute",
+        default=_read_env("ZOHO_MRC_REGION_CODE_ATTRIBUTE", "ZOHO_REGION_FALLBACK_CODE_ATTRIBUTE", default="MRS_CO_REG"),
+        help="MRC shapefile attribute that contains the region code.",
+    )
+    region_parser.add_argument(
         "--shape-path",
         type=Path,
-        default=Path(_read_env("ZOHO_REGION_SHAPE_PATH", default="") or "."),
-        help="Path to a .shp file or a folder containing one.",
+        default=Path(_read_env("ZOHO_REGION_SHAPE_PATH")) if _read_env("ZOHO_REGION_SHAPE_PATH") else None,
+        help="Final region fallback shapefile (.shp) path.",
     )
     region_parser.add_argument(
         "--shape-name-attribute",
         default=_read_env("ZOHO_REGION_NAME_ATTRIBUTE", default="RES_NM_REG"),
-        help="Shapefile attribute name that contains the region name.",
+        help="Region shapefile attribute that contains the region name.",
     )
     region_parser.add_argument(
         "--shape-code-attribute",
         default=_read_env("ZOHO_REGION_CODE_ATTRIBUTE", default="RES_CO_REG"),
-        help="Shapefile attribute name that contains the region code.",
+        help="Region shapefile attribute that contains the region code.",
+    )
+    region_parser.add_argument(
+        "--fallback-shape-path",
+        type=Path,
+        default=Path(_read_env("ZOHO_REGION_FALLBACK_SHAPE_PATH")) if _read_env("ZOHO_REGION_FALLBACK_SHAPE_PATH") else None,
+        help="Deprecated alias for --mrc-shape-path.",
+    )
+    region_parser.add_argument(
+        "--fallback-shape-name-attribute",
+        default=_read_env("ZOHO_REGION_FALLBACK_NAME_ATTRIBUTE", default=""),
+        help="Deprecated alias for --mrc-region-attribute.",
+    )
+    region_parser.add_argument(
+        "--fallback-shape-code-attribute",
+        default=_read_env("ZOHO_REGION_FALLBACK_CODE_ATTRIBUTE", default=""),
+        help="Deprecated alias for --mrc-region-code-attribute.",
     )
     region_parser.add_argument(
         "--failure-report",
         type=Path,
         default=Path(_read_env("ZOHO_REGION_FAILURE_REPORT_PATH", default="quote-region-failures.xlsx") or "quote-region-failures.xlsx"),
-        help="Excel report path for quotes with missing coordinates or failed region updates.",
+        help="Excel report path for quotes with missing coordinates, partial boundary matches, or failed region updates.",
     )
     region_parser.add_argument(
         "--update-existing-region",
         action="store_true",
-        help="Update region fields even when the quote already has a region value.",
+        help="Update Region, MRC, and Muni fields even when the quote already has values.",
     )
 
     return parser
@@ -1234,21 +1435,62 @@ def _build_configs(args: argparse.Namespace) -> tuple[ZohoAuthConfig, QuoteField
         longitude_field=getattr(args, "longitude_field", None),
         region_name_field=getattr(args, "region_name_field", None),
         region_code_field=getattr(args, "region_code_field", None),
+        mrc_name_field=getattr(args, "mrc_name_field", None),
+        muni_name_field=getattr(args, "muni_name_field", None),
         coordinate_decimal_places=args.coordinate_decimals,
         coordinate_max_length=args.coordinate_max_length,
     )
     return zoho_config, field_config
 
 
-def _build_region_lookup_config(args: argparse.Namespace) -> RegionLookupConfig:
-    shape_path = getattr(args, "shape_path", None)
-    if not shape_path:
-        raise ConfigError("A shapefile path is required for region sync. Set ZOHO_REGION_SHAPE_PATH or pass --shape-path.")
-    return RegionLookupConfig(
-        shape_path=Path(shape_path),
-        region_name_attribute=args.shape_name_attribute,
-        region_code_attribute=args.shape_code_attribute or None,
-    )
+def _build_region_lookup_configs(args: argparse.Namespace) -> list[RegionLookupConfig]:
+    configs: list[RegionLookupConfig] = []
+
+    muni_shape_path = getattr(args, "muni_shape_path", None)
+    if muni_shape_path:
+        configs.append(
+            RegionLookupConfig(
+                source_label="municipality",
+                shape_path=Path(muni_shape_path),
+                region_name_attribute=args.muni_region_attribute,
+                region_code_attribute=args.muni_region_code_attribute or None,
+                mrc_name_attribute=args.muni_mrc_attribute or None,
+                muni_name_attribute=args.muni_name_attribute or None,
+            )
+        )
+
+    mrc_shape_path = getattr(args, "mrc_shape_path", None) or getattr(args, "fallback_shape_path", None)
+    if mrc_shape_path:
+        mrc_region_attribute = getattr(args, "mrc_region_attribute", "") or getattr(args, "fallback_shape_name_attribute", "")
+        mrc_region_code_attribute = getattr(args, "mrc_region_code_attribute", "") or getattr(args, "fallback_shape_code_attribute", "")
+        configs.append(
+            RegionLookupConfig(
+                source_label="mrc",
+                shape_path=Path(mrc_shape_path),
+                region_name_attribute=mrc_region_attribute or "MRS_NM_REG",
+                region_code_attribute=mrc_region_code_attribute or None,
+                mrc_name_attribute=args.mrc_name_attribute or None,
+            )
+        )
+
+    region_shape_path = getattr(args, "shape_path", None)
+    if region_shape_path:
+        configs.append(
+            RegionLookupConfig(
+                source_label="region",
+                shape_path=Path(region_shape_path),
+                region_name_attribute=args.shape_name_attribute,
+                region_code_attribute=args.shape_code_attribute or None,
+            )
+        )
+
+    if not configs:
+        raise ConfigError(
+            "At least one shapefile path is required for region sync. "
+            "Set ZOHO_MUNI_SHAPE_PATH, ZOHO_MRC_SHAPE_PATH, or ZOHO_REGION_SHAPE_PATH."
+        )
+
+    return configs
 
 
 def _configure_logging(level_name: str) -> logging.Logger:
@@ -1295,11 +1537,12 @@ def main(argv: list[str] | None = None) -> int:
                         dry_run=args.dry_run,
                     )
             else:
-                region_config = _build_region_lookup_config(args)
-                with RegionShapeResolver(region_config, logger) as resolver:
+                region_configs = _build_region_lookup_configs(args)
+                with ExitStack() as stack:
+                    resolvers = [stack.enter_context(RegionShapeResolver(config, logger)) for config in region_configs]
                     payload = sync_quote_regions(
                         zoho_client,
-                        resolver,
+                        resolvers,
                         max_records=args.max_records,
                         update_existing=args.update_existing_region,
                     )
@@ -1342,14 +1585,19 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         else:
             logger.info(
-                "Fetched=%s Updated=%s MissingCoordinates=%s ExistingRegion=%s NoRegionMatch=%s RegionLookupErrors=%s UpdateErrors=%s",
+                "Fetched=%s Updated=%s UpdatedPartial=%s MissingCoordinates=%s ExistingAdmin=%s NoRegionMatch=%s NoAdminUpdates=%s RegionLookupErrors=%s UpdateErrors=%s MatchedByMuni=%s MatchedByMrc=%s MatchedByRegion=%s",
                 summary["fetched"],
                 summary["updated"],
+                summary["updated_partial"],
                 summary["skipped_missing_coordinates"],
-                summary["skipped_existing_region"],
+                summary["skipped_existing_admin_fields"],
                 summary["no_region_match"],
+                summary["no_admin_update_values"],
                 summary["region_lookup_errors"],
                 summary["update_errors"],
+                summary["matched_by_muni"],
+                summary["matched_by_mrc"],
+                summary["matched_by_region"],
             )
             if summary["region_lookup_errors"] or summary["update_errors"]:
                 return 1
