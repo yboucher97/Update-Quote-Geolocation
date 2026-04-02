@@ -32,6 +32,8 @@ After install, the important paths are:
 /opt/services/quote-geolocation/logs/
 /etc/systemd/system/quote-geolocation.service
 /etc/caddy/conf.d/webhooks.caddy
+/etc/caddy/conf.d/webhooks.routes/
+/etc/caddy/conf.d/webhooks.routes/quote-geolocation.caddy
 ```
 
 The app code, venv, config, data, and logs all stay together under one service folder.
@@ -54,7 +56,9 @@ The installer:
 - stores logs in `/opt/services/quote-geolocation/logs`
 - creates `quote-geolocation.service`
 - disables the older `update-quote-geolocation` package service if it exists
-- writes the shared Caddy file at `/etc/caddy/conf.d/webhooks.caddy`
+- writes or updates the shared Caddy host file at `/etc/caddy/conf.d/webhooks.caddy`
+- writes its own route snippet at `/etc/caddy/conf.d/webhooks.routes/quote-geolocation.caddy`
+- uses port `8050` by default, or the next free local port if `8050` is already in use
 
 ## Update
 
@@ -70,12 +74,18 @@ That keeps the same paths, refreshes the repo, rebuilds the venv, reapplies the 
 
 This installer assumes the quote geolocation webhook and the PDF generator webhook live on the same VM and same hostname.
 
-The shared Caddy file routes:
+The shared Caddy host file imports every per-app route snippet from:
+
+```text
+/etc/caddy/conf.d/webhooks.routes/*.caddy
+```
+
+This service contributes only its own route snippet. It does not need to know how the PDF generator app is installed.
+
+The quote route snippet exposes:
 
 - `/quote-geolocation/*` to the geolocation service on `127.0.0.1:8050`
-- `/pdf/*` to the PDF service on `127.0.0.1:8000`
 - the older quote paths `/webhooks/zoho/quote-geolocation*` and `/health/quote-geolocation*` to the geolocation service
-- everything else to the PDF service for backward compatibility
 
 So the preferred public paths are:
 
@@ -117,6 +127,7 @@ Important values:
 - `ZOHO_MRC_SHAPE_PATH`
 - `ZOHO_REGION_SHAPE_PATH`
 - `ZOHO_QUOTE_WEBHOOK_SECRET`
+- `ZOHO_QUOTE_WEBHOOK_PORT`
 
 Recommended Quebec shapefile paths:
 
@@ -187,6 +198,20 @@ info response;
   `/opt/services/quote-geolocation/logs/quote-geolocation.log`
 - reports directory:
   `/opt/services/quote-geolocation/data/reports`
+
+## Future Apps
+
+If you add a third webhook app later, the same pattern should be reused:
+
+- `/opt/services/<app-name>/app`
+- `/opt/services/<app-name>/.venv`
+- `/opt/services/<app-name>/config`
+- `/opt/services/<app-name>/data`
+- `/opt/services/<app-name>/logs`
+- one systemd unit under `/etc/systemd/system`
+- one per-app Caddy route snippet under `/etc/caddy/conf.d/webhooks.routes`
+
+Each installer should choose its own local port, then add only its own route snippet. That keeps the repos separate and avoids one app overwriting another app's reverse-proxy config.
 
 ## Archived Paths
 

@@ -2,26 +2,27 @@
 set -euo pipefail
 
 APP_NAME="quote-geolocation"
-SERVICE_NAME="${QUOTE_GEO_SERVICE_NAME:-quote-geolocation}"
-SERVICE_USER="${QUOTE_GEO_SERVICE_USER:-quotegeo}"
-SERVICE_ROOT="${QUOTE_GEO_SERVICE_ROOT:-/opt/services/${APP_NAME}}"
-APP_DIR="${QUOTE_GEO_APP_DIR:-${SERVICE_ROOT}/app}"
-VENV_DIR="${QUOTE_GEO_VENV_DIR:-${SERVICE_ROOT}/.venv}"
-CONFIG_DIR="${QUOTE_GEO_CONFIG_DIR:-${SERVICE_ROOT}/config}"
-DATA_DIR="${QUOTE_GEO_DATA_DIR:-${SERVICE_ROOT}/data}"
-LOG_DIR="${QUOTE_GEO_LOG_DIR:-${SERVICE_ROOT}/logs}"
-ENV_FILE="${QUOTE_GEO_ENV_FILE:-${CONFIG_DIR}/zoho_quote_geocode.env}"
-META_FILE="${QUOTE_GEO_META_FILE:-${CONFIG_DIR}/install-meta.env}"
-PATHS_FILE="${QUOTE_GEO_PATHS_FILE:-${CONFIG_DIR}/paths.txt}"
-REPO_URL="${QUOTE_GEO_REPO_URL:-https://github.com/yboucher97/Update-Quote-Geolocation.git}"
-REPO_REF="${QUOTE_GEO_REPO_REF:-main}"
-PORT="${QUOTE_GEO_PORT:-8050}"
-HOST="${QUOTE_GEO_HOST:-}"
-PDF_PORT="${QUOTE_GEO_PDF_PORT:-8000}"
+SERVICE_NAME="${QUOTE_GEO_SERVICE_NAME:-${SERVICE_NAME:-quote-geolocation}}"
+SERVICE_USER="${QUOTE_GEO_SERVICE_USER:-${SERVICE_USER:-quotegeo}}"
+SERVICE_ROOT="${QUOTE_GEO_SERVICE_ROOT:-${SERVICE_ROOT:-/opt/services/${APP_NAME}}}"
+APP_DIR="${QUOTE_GEO_APP_DIR:-${APP_DIR:-${SERVICE_ROOT}/app}}"
+VENV_DIR="${QUOTE_GEO_VENV_DIR:-${VENV_DIR:-${SERVICE_ROOT}/.venv}}"
+CONFIG_DIR="${QUOTE_GEO_CONFIG_DIR:-${CONFIG_DIR:-${SERVICE_ROOT}/config}}"
+DATA_DIR="${QUOTE_GEO_DATA_DIR:-${DATA_DIR:-${SERVICE_ROOT}/data}}"
+LOG_DIR="${QUOTE_GEO_LOG_DIR:-${LOG_DIR:-${SERVICE_ROOT}/logs}}"
+ENV_FILE="${QUOTE_GEO_ENV_FILE:-${ENV_FILE:-${CONFIG_DIR}/zoho_quote_geocode.env}}"
+META_FILE="${QUOTE_GEO_META_FILE:-${META_FILE:-${CONFIG_DIR}/install-meta.env}}"
+PATHS_FILE="${QUOTE_GEO_PATHS_FILE:-${PATHS_FILE:-${CONFIG_DIR}/paths.txt}}"
+REPO_URL="${QUOTE_GEO_REPO_URL:-${REPO_URL:-https://github.com/yboucher97/Update-Quote-Geolocation.git}}"
+REPO_REF="${QUOTE_GEO_REPO_REF:-${REPO_REF:-main}}"
+PORT="${QUOTE_GEO_PORT:-${PORT:-8050}}"
+HOST="${QUOTE_GEO_HOST:-${HOST:-}}"
 UFW_MODE="${QUOTE_GEO_CONFIGURE_UFW:-auto}"
 INSTALL_OWNER="${QUOTE_GEO_INSTALL_OWNER:-${SUDO_USER:-$(id -un)}}"
 INSTALL_OWNER_HOME="${QUOTE_GEO_OWNER_HOME:-}"
-CADDY_FILE="${QUOTE_GEO_CADDY_FILE:-/etc/caddy/conf.d/webhooks.caddy}"
+CADDY_FILE="${QUOTE_GEO_CADDY_FILE:-${CADDY_FILE:-/etc/caddy/conf.d/webhooks.caddy}}"
+CADDY_ROUTES_DIR="${QUOTE_GEO_CADDY_ROUTES_DIR:-${CADDY_ROUTES_DIR:-/etc/caddy/conf.d/webhooks.routes}}"
+CADDY_ROUTE_FILE="${QUOTE_GEO_CADDY_ROUTE_FILE:-${CADDY_ROUTE_FILE:-${CADDY_ROUTES_DIR}/${SERVICE_NAME}.caddy}}"
 LEGACY_ENV_FILE="${QUOTE_GEO_LEGACY_ENV_FILE:-/etc/update-quote-geolocation/zoho_quote_geocode.env}"
 
 log() {
@@ -93,6 +94,40 @@ ensure_user_and_dirs() {
   mkdir -p "$SERVICE_ROOT" "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR" "${DATA_DIR}/reports"
   chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR" "$LOG_DIR"
   chmod 755 "$SERVICE_ROOT" "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR"
+}
+
+port_in_use() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnH "( sport = :${port} )" 2>/dev/null | grep -q .
+    return
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1
+    return
+  fi
+  return 1
+}
+
+select_service_port() {
+  local preferred_port="$1"
+  local service_file="/etc/systemd/system/${SERVICE_NAME}.service"
+  local chosen_port="$preferred_port"
+
+  if [[ -f "$service_file" ]] && grep -Fq -- "--port ${preferred_port}" "$service_file"; then
+    PORT="$preferred_port"
+    return
+  fi
+
+  while port_in_use "$chosen_port"; do
+    chosen_port="$((chosen_port + 1))"
+  done
+
+  if [[ "$chosen_port" != "$preferred_port" ]]; then
+    log "Port ${preferred_port} is already in use. Using ${chosen_port} instead."
+  fi
+
+  PORT="$chosen_port"
 }
 
 disable_legacy_services() {
@@ -205,9 +240,10 @@ write_install_metadata() {
     printf 'META_FILE=%q\n' "$META_FILE"
     printf 'PATHS_FILE=%q\n' "$PATHS_FILE"
     printf 'CADDY_FILE=%q\n' "$CADDY_FILE"
+    printf 'CADDY_ROUTES_DIR=%q\n' "$CADDY_ROUTES_DIR"
+    printf 'CADDY_ROUTE_FILE=%q\n' "$CADDY_ROUTE_FILE"
     printf 'HOST=%q\n' "$HOST"
     printf 'PORT=%q\n' "$PORT"
-    printf 'PDF_PORT=%q\n' "$PDF_PORT"
     printf 'REPO_REF=%q\n' "$REPO_REF"
   } >"$META_FILE"
   chmod 644 "$META_FILE"
@@ -228,6 +264,8 @@ write_paths_file() {
     printf '%s  # local update script\n' "${APP_DIR}/update.sh"
     if [[ -n "$HOST" ]]; then
       printf '%s  # shared Caddy site config\n' "$CADDY_FILE"
+      printf '%s  # per-app Caddy route snippets\n' "$CADDY_ROUTES_DIR"
+      printf '%s  # this service Caddy route snippet\n' "$CADDY_ROUTE_FILE"
     fi
   } >"$PATHS_FILE"
 
@@ -269,7 +307,7 @@ configure_caddy() {
     return
   fi
 
-  mkdir -p /etc/caddy/conf.d
+  mkdir -p /etc/caddy/conf.d "$CADDY_ROUTES_DIR"
   if [[ ! -f /etc/caddy/Caddyfile ]] || grep -Fq '/usr/share/caddy' /etc/caddy/Caddyfile; then
     cat >/etc/caddy/Caddyfile <<'EOF'
 import /etc/caddy/conf.d/*.caddy
@@ -278,36 +316,41 @@ EOF
     printf '\nimport /etc/caddy/conf.d/*.caddy\n' >> /etc/caddy/Caddyfile
   fi
 
+  if [[ -f "$CADDY_FILE" ]]; then
+    local existing_host
+    existing_host="$(sed -n '1s/[[:space:]]*{[[:space:]]*$//p' "$CADDY_FILE" | head -n1)"
+    if [[ -n "$existing_host" && "$existing_host" != "$HOST" ]]; then
+      fail "Caddy host file ${CADDY_FILE} already targets '${existing_host}'. Reuse that hostname or update the file manually."
+    fi
+  fi
+
   cat >"$CADDY_FILE" <<EOF
 ${HOST} {
-    handle_path /quote-geolocation/* {
-        reverse_proxy 127.0.0.1:${PORT}
-    }
+    import ${CADDY_ROUTES_DIR}/*.caddy
+}
+EOF
 
-    handle /health/quote-geolocation* {
-        reverse_proxy 127.0.0.1:${PORT}
-    }
+  cat >"$CADDY_ROUTE_FILE" <<EOF
+handle_path /quote-geolocation/* {
+    reverse_proxy 127.0.0.1:${PORT}
+}
 
-    handle /webhooks/quote-geolocation* {
-        reverse_proxy 127.0.0.1:${PORT}
-    }
+handle /health/quote-geolocation* {
+    reverse_proxy 127.0.0.1:${PORT}
+}
 
-    handle /webhooks/zoho/quote-geolocation* {
-        reverse_proxy 127.0.0.1:${PORT}
-    }
+handle /webhooks/quote-geolocation* {
+    reverse_proxy 127.0.0.1:${PORT}
+}
 
-    handle_path /pdf/* {
-        reverse_proxy 127.0.0.1:${PDF_PORT}
-    }
-
-    handle {
-        reverse_proxy 127.0.0.1:${PDF_PORT}
-    }
+handle /webhooks/zoho/quote-geolocation* {
+    reverse_proxy 127.0.0.1:${PORT}
 }
 EOF
 
   caddy fmt --overwrite /etc/caddy/Caddyfile >/dev/null
   caddy fmt --overwrite "$CADDY_FILE" >/dev/null
+  caddy fmt --overwrite "$CADDY_ROUTE_FILE" >/dev/null
   caddy validate --config /etc/caddy/Caddyfile
   systemctl enable --now caddy
   systemctl reload caddy
@@ -345,6 +388,7 @@ main() {
   ensure_packages
   ensure_user_and_dirs
   disable_legacy_services
+  select_service_port "$PORT"
   sync_repo
   migrate_legacy_env_file
   seed_env_file
