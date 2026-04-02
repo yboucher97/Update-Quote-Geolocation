@@ -82,8 +82,8 @@ def _run_single_quote_from_webhook(
                     resolvers,
                     quote_id,
                     arrond_resolver=arrond_resolver,
-                    skip_existing=not update_existing,
-                    update_existing_region=update_existing_region,
+                    skip_existing=not getattr(args, "update_existing", False),
+                    update_existing_region=getattr(args, "update_existing_region", False),
                 )
 
     meta = payload.get("meta") or {}
