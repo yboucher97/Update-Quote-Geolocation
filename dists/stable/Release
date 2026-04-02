@@ -1,0 +1,40 @@
+Origin: yboucher97
+Label: Update Quote Geolocation
+Suite: stable
+Codename: stable
+Architectures: all amd64 arm64
+Components: main
+Description: APT repository for update-quote-geolocation
+Date: Thu, 02 Apr 2026 17:43:55 +0000
+MD5Sum:
+ 387f0f792117e78603861775ff535b3c              225 Release
+ 0887c45b3ff25ca70abf80cf8681075f              639 main/binary-all/Packages
+ a415f29578521e7a13a17808303b28d1              443 main/binary-all/Packages.gz
+ 0887c45b3ff25ca70abf80cf8681075f              639 main/binary-amd64/Packages
+ a415f29578521e7a13a17808303b28d1              443 main/binary-amd64/Packages.gz
+ 0887c45b3ff25ca70abf80cf8681075f              639 main/binary-arm64/Packages
+ a415f29578521e7a13a17808303b28d1              443 main/binary-arm64/Packages.gz
+SHA1:
+ 78d9ce7b7d29b453aeda6b9196445f4104da7d22              225 Release
+ 87ef0e422d166a84a870284a98683874c0e7e74f              639 main/binary-all/Packages
+ f88162b7c9226ac33559c576c9e2433dfb0922c2              443 main/binary-all/Packages.gz
+ 87ef0e422d166a84a870284a98683874c0e7e74f              639 main/binary-amd64/Packages
+ f88162b7c9226ac33559c576c9e2433dfb0922c2              443 main/binary-amd64/Packages.gz
+ 87ef0e422d166a84a870284a98683874c0e7e74f              639 main/binary-arm64/Packages
+ f88162b7c9226ac33559c576c9e2433dfb0922c2              443 main/binary-arm64/Packages.gz
+SHA256:
+ f04bbd3c52cd91bdc6da5ea76942b2c6a8011e9e49a9eff6ddabe9d214a7a041              225 Release
+ 774ab62dd9b170f9ac5b616794963c0d539641163139c6021ad88513ea1a3af3              639 main/binary-all/Packages
+ 5dd9dd4abe631286ca4d5aca0f7d1195a75edfee9fd5032dd4671b6653a7ef23              443 main/binary-all/Packages.gz
+ 774ab62dd9b170f9ac5b616794963c0d539641163139c6021ad88513ea1a3af3              639 main/binary-amd64/Packages
+ 5dd9dd4abe631286ca4d5aca0f7d1195a75edfee9fd5032dd4671b6653a7ef23              443 main/binary-amd64/Packages.gz
+ 774ab62dd9b170f9ac5b616794963c0d539641163139c6021ad88513ea1a3af3              639 main/binary-arm64/Packages
+ 5dd9dd4abe631286ca4d5aca0f7d1195a75edfee9fd5032dd4671b6653a7ef23              443 main/binary-arm64/Packages.gz
+SHA512:
+ db66a8692ce1353effd7afacc625eacbe6dce82b531206501ae2f2b9c3c231c5340a97634782c2cbf026dabf0f9425e2c64f3cfb47f0a7cb019878144c9b3e33              225 Release
+ 68a71661dbaf9b979c98c8d1e6fd859a1d040da6d8699487520dbc3810ad941397cd6208df32ef8c7add1db105cadccb0eb2717a8c23b609e263474c23da2bc5              639 main/binary-all/Packages
+ c0d8db3ef1b54c9b58324fb8043a77953676f2c7fa37452a07ba28fe3d6b8aa6d734889f2d124f14a70bb926f5e57af6f0667d41f080901a294cfba229cb40be              443 main/binary-all/Packages.gz
+ 68a71661dbaf9b979c98c8d1e6fd859a1d040da6d8699487520dbc3810ad941397cd6208df32ef8c7add1db105cadccb0eb2717a8c23b609e263474c23da2bc5              639 main/binary-amd64/Packages
+ c0d8db3ef1b54c9b58324fb8043a77953676f2c7fa37452a07ba28fe3d6b8aa6d734889f2d124f14a70bb926f5e57af6f0667d41f080901a294cfba229cb40be              443 main/binary-amd64/Packages.gz
+ 68a71661dbaf9b979c98c8d1e6fd859a1d040da6d8699487520dbc3810ad941397cd6208df32ef8c7add1db105cadccb0eb2717a8c23b609e263474c23da2bc5              639 main/binary-arm64/Packages
+ c0d8db3ef1b54c9b58324fb8043a77953676f2c7fa37452a07ba28fe3d6b8aa6d734889f2d124f14a70bb926f5e57af6f0667d41f080901a294cfba229cb40be              443 main/binary-arm64/Packages.gz

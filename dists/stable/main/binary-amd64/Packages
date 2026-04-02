@@ -1,0 +1,16 @@
+Package: update-quote-geolocation
+Version: 0.1.22
+Architecture: all
+Maintainer: yboucher97 <yboucher97@users.noreply.github.com>
+Depends: python3
+Filename: pool/main/u/update-quote-geolocation/update-quote-geolocation_0.1.22_all.deb
+Size: 2827640
+MD5sum: f677a80e74ab50bcfa2ccfacec6911cf
+SHA1: 24fd1dc01fb21332d0d7da7e76617025fb49a51d
+SHA256: fea4d6e75168d9213f18a72b725968378e06fa835882f1fb96c1b27ea7e3e57a
+Section: utils
+Priority: optional
+Description: Zoho CRM quote geolocation updater
+ Receives quote IDs by webhook, geocodes quote shipping addresses with the
+ Google Geocoding API, resolves Quebec boundaries, and updates Zoho CRM.
+
