@@ -17,6 +17,7 @@ REPO_URL="${QUOTE_GEO_REPO_URL:-${REPO_URL:-https://github.com/yboucher97/Update
 REPO_REF="${QUOTE_GEO_REPO_REF:-${REPO_REF:-main}}"
 PORT="${QUOTE_GEO_PORT:-${PORT:-8050}}"
 HOST="${QUOTE_GEO_HOST:-${HOST:-}}"
+WEBHOOK_SECRET="${QUOTE_GEO_WEBHOOK_SECRET:-${ZOHO_QUOTE_WEBHOOK_SECRET:-}}"
 UFW_MODE="${QUOTE_GEO_CONFIGURE_UFW:-auto}"
 INSTALL_OWNER="${QUOTE_GEO_INSTALL_OWNER:-${SUDO_USER:-$(id -un)}}"
 INSTALL_OWNER_HOME="${QUOTE_GEO_OWNER_HOME:-}"
@@ -24,6 +25,8 @@ CADDY_FILE="${QUOTE_GEO_CADDY_FILE:-${CADDY_FILE:-/etc/caddy/conf.d/webhooks.cad
 CADDY_ROUTES_DIR="${QUOTE_GEO_CADDY_ROUTES_DIR:-${CADDY_ROUTES_DIR:-/etc/caddy/conf.d/webhooks.routes}}"
 CADDY_ROUTE_FILE="${QUOTE_GEO_CADDY_ROUTE_FILE:-${CADDY_ROUTE_FILE:-${CADDY_ROUTES_DIR}/${SERVICE_NAME}.caddy}}"
 LEGACY_ENV_FILE="${QUOTE_GEO_LEGACY_ENV_FILE:-/etc/update-quote-geolocation/zoho_quote_geocode.env}"
+WEBHOOK_SECRET_SOURCE=""
+GENERATED_WEBHOOK_SECRET=""
 
 log() {
   printf '[%s] %s\n' "${APP_NAME}" "$*"
@@ -32,6 +35,10 @@ log() {
 fail() {
   printf '[%s] ERROR: %s\n' "${APP_NAME}" "$*" >&2
   exit 1
+}
+
+generate_secret() {
+  od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
 }
 
 initialize_context() {
@@ -47,6 +54,32 @@ initialize_context() {
       fi
     fi
   fi
+}
+
+read_env_value_from_file() {
+  local file_path="$1"
+  local key_name="$2"
+
+  if [[ ! -f "$file_path" ]]; then
+    return 1
+  fi
+
+  python3 - "$file_path" "$key_name" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+key = sys.argv[2]
+for raw_line in path.read_text(encoding="utf-8").splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    current_key, value = line.split("=", 1)
+    if current_key.strip() == key:
+        print(value.strip())
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
 }
 
 prompt() {
@@ -162,6 +195,31 @@ migrate_legacy_env_file() {
   fi
 }
 
+prepare_webhook_secret() {
+  local current_secret=""
+
+  if [[ -n "$WEBHOOK_SECRET" ]]; then
+    WEBHOOK_SECRET_SOURCE="provided"
+    return
+  fi
+
+  if current_secret="$(read_env_value_from_file "$ENV_FILE" "ZOHO_QUOTE_WEBHOOK_SECRET" 2>/dev/null)"; then
+    WEBHOOK_SECRET="$current_secret"
+    WEBHOOK_SECRET_SOURCE="existing"
+    return
+  fi
+
+  if current_secret="$(read_env_value_from_file "$LEGACY_ENV_FILE" "ZOHO_QUOTE_WEBHOOK_SECRET" 2>/dev/null)"; then
+    WEBHOOK_SECRET="$current_secret"
+    WEBHOOK_SECRET_SOURCE="existing"
+    return
+  fi
+
+  WEBHOOK_SECRET="$(generate_secret)"
+  GENERATED_WEBHOOK_SECRET="$WEBHOOK_SECRET"
+  WEBHOOK_SECRET_SOURCE="generated"
+}
+
 seed_env_file() {
   if [[ ! -f "$ENV_FILE" ]]; then
     cp "${APP_DIR}/zoho_quote_geocode.env.example" "$ENV_FILE"
@@ -170,6 +228,7 @@ seed_env_file() {
   ENV_FILE="$ENV_FILE" \
   REPORT_ROOT="${DATA_DIR}/reports" \
   PORT="$PORT" \
+  WEBHOOK_SECRET="$WEBHOOK_SECRET" \
   python3 - <<'PY'
 import os
 from pathlib import Path
@@ -192,6 +251,7 @@ defaults = {
     "ZOHO_QUOTE_RUN_ONE_REPORT_PATH": f"{os.environ['REPORT_ROOT']}/quote-run-one-report.xlsx",
     "ZOHO_QUOTE_WEBHOOK_HOST": "127.0.0.1",
     "ZOHO_QUOTE_WEBHOOK_PORT": os.environ["PORT"],
+    "ZOHO_QUOTE_WEBHOOK_SECRET": os.environ["WEBHOOK_SECRET"],
 }
 for key, value in defaults.items():
     values.setdefault(key, value)
@@ -204,6 +264,7 @@ ordered_keys = [
     "ZOHO_QUOTE_RUN_ONE_REPORT_PATH",
     "ZOHO_QUOTE_WEBHOOK_HOST",
     "ZOHO_QUOTE_WEBHOOK_PORT",
+    "ZOHO_QUOTE_WEBHOOK_SECRET",
 ]
 present = {line.split("=", 1)[0].strip() for line in existing_lines if "=" in line and not line.lstrip().startswith("#")}
 lines = list(existing_lines)
@@ -372,6 +433,18 @@ configure_ufw() {
 
 report_follow_up() {
   log "Edit ${ENV_FILE} with your Zoho OAuth settings, Google API key, field names, and shapefile paths."
+  case "$WEBHOOK_SECRET_SOURCE" in
+    generated)
+      log "Generated webhook secret. Copy this value now:"
+      printf '%s\n' "$GENERATED_WEBHOOK_SECRET"
+      ;;
+    existing)
+      log "Existing webhook secret preserved in ${ENV_FILE}"
+      ;;
+    provided)
+      log "Webhook secret stored from installer input in ${ENV_FILE}"
+      ;;
+  esac
   log "Then restart the service if you changed credentials:"
   log "  sudo systemctl restart ${SERVICE_NAME}"
 }
@@ -391,6 +464,7 @@ main() {
   select_service_port "$PORT"
   sync_repo
   migrate_legacy_env_file
+  prepare_webhook_secret
   seed_env_file
   install_python_deps
   write_install_metadata

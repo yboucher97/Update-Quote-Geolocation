@@ -59,6 +59,8 @@ The installer:
 - writes or updates the shared Caddy host file at `/etc/caddy/conf.d/webhooks.caddy`
 - writes its own route snippet at `/etc/caddy/conf.d/webhooks.routes/quote-geolocation.caddy`
 - uses port `8050` by default, or the next free local port if `8050` is already in use
+- generates `ZOHO_QUOTE_WEBHOOK_SECRET` automatically if missing and prints it once so you can copy it
+- preserves the existing `ZOHO_QUOTE_WEBHOOK_SECRET` on later installs or updates unless you explicitly pass a new one
 
 ## Update
 
