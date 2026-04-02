@@ -113,9 +113,10 @@ def health() -> dict[str, bool]:
 @router.post("/quote-geolocation/webhooks/zoho/quote-geolocation")
 def quote_geolocation_webhook(
     payload: QuoteGeolocationWebhookRequest,
-    x_webhook_secret: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
 ) -> dict:
-    _ensure_webhook_secret(x_webhook_secret)
+    _ensure_webhook_secret(x_api_key or x_webhook_secret)
 
     try:
         return _run_single_quote_from_webhook(

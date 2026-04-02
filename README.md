@@ -157,7 +157,7 @@ Direct local checks:
 curl http://127.0.0.1:8050/health/quote-geolocation
 curl -X POST http://127.0.0.1:8050/webhooks/zoho/quote-geolocation \
   -H "Content-Type: application/json" \
-  -H "X-Webhook-Secret: your_shared_secret" \
+  -H "X-API-Key: your_shared_secret" \
   -d '{"quote_id":"4143382000212414002"}'
 ```
 
@@ -167,7 +167,7 @@ Preferred public checks through Caddy:
 curl https://api01.wifiplex.ca/quote-geolocation/health
 curl -X POST https://api01.wifiplex.ca/quote-geolocation/webhooks/zoho/quote-geolocation \
   -H "Content-Type: application/json" \
-  -H "X-Webhook-Secret: your_shared_secret" \
+  -H "X-API-Key: your_shared_secret" \
   -d '{"quote_id":"4143382000212414002"}'
 ```
 
@@ -184,9 +184,8 @@ response = invokeurl
     url :"https://api01.wifiplex.ca/quote-geolocation/webhooks/zoho/quote-geolocation"
     type :POST
     content-type :"application/json"
-    headers:{"X-Webhook-Secret":"YOUR_SECRET_HERE"}
+    headers:{"X-API-Key":"YOUR_SECRET_HERE"}
     body:payload.toString()
-    detailed:true
 ];
 
 info response;
