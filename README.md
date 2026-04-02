@@ -91,8 +91,8 @@ The quote route snippet exposes:
 
 So the preferred public paths are:
 
-- quote health: `https://pdf.wifiplex.ca/quote-geolocation/health`
-- quote webhook: `https://pdf.wifiplex.ca/quote-geolocation/webhooks/zoho/quote-geolocation`
+- quote health: `https://api01.wifiplex.ca/quote-geolocation/health`
+- quote webhook: `https://api01.wifiplex.ca/quote-geolocation/webhooks/zoho/quote-geolocation`
 
 The older quote paths still work because Caddy explicitly keeps them routed.
 
@@ -164,8 +164,8 @@ curl -X POST http://127.0.0.1:8050/webhooks/zoho/quote-geolocation \
 Preferred public checks through Caddy:
 
 ```bash
-curl https://pdf.wifiplex.ca/quote-geolocation/health
-curl -X POST https://pdf.wifiplex.ca/quote-geolocation/webhooks/zoho/quote-geolocation \
+curl https://api01.wifiplex.ca/quote-geolocation/health
+curl -X POST https://api01.wifiplex.ca/quote-geolocation/webhooks/zoho/quote-geolocation \
   -H "Content-Type: application/json" \
   -H "X-Webhook-Secret: your_shared_secret" \
   -d '{"quote_id":"4143382000212414002"}'
@@ -181,7 +181,7 @@ payload.put("quote_id", quoteId);
 
 response = invokeurl
 [
-    url :"https://pdf.wifiplex.ca/quote-geolocation/webhooks/zoho/quote-geolocation"
+    url :"https://api01.wifiplex.ca/quote-geolocation/webhooks/zoho/quote-geolocation"
     type :POST
     content-type :"application/json"
     headers:{"X-Webhook-Secret":"YOUR_SECRET_HERE"}
