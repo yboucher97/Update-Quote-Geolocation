@@ -275,8 +275,8 @@ for key in ordered_keys:
 path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 PY
 
-  chmod 600 "$ENV_FILE"
-  chown root:root "$ENV_FILE"
+  chmod 640 "$ENV_FILE"
+  chown root:"$SERVICE_USER" "$ENV_FILE"
 }
 
 install_python_deps() {
