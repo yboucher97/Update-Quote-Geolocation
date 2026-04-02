@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import os
 from contextlib import ExitStack
 
-from fastapi import APIRouter, FastAPI, Header, HTTPException
+from fastapi import APIRouter, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 import shapefile
 
 import zoho_quote_geocode as geocode
+
+
+logger = logging.getLogger("zoho-quote-geocode.webhook")
 
 
 class QuoteGeolocationWebhookRequest(BaseModel):
@@ -112,16 +116,26 @@ def health() -> dict[str, bool]:
 @router.post("/quote-geolocation/webhooks/quote-geolocation")
 @router.post("/quote-geolocation/webhooks/zoho/quote-geolocation")
 def quote_geolocation_webhook(
+    request: Request,
     payload: QuoteGeolocationWebhookRequest,
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
 ) -> dict:
+    geocode._configure_logging(os.getenv("LOG_LEVEL", "INFO"))
     _ensure_webhook_secret(x_api_key or x_webhook_secret)
+    logger.info(
+        "Received quote geolocation webhook path=%s client=%s quote_id=%s",
+        request.url.path,
+        request.client.host if request.client else "unknown",
+        payload.quote_id,
+    )
 
     try:
-        return _run_single_quote_from_webhook(
+        response = _run_single_quote_from_webhook(
             payload.quote_id,
         )
+        logger.info("Quote geolocation webhook completed successfully for quote_id=%s", payload.quote_id)
+        return response
     except HTTPException:
         raise
     except (
@@ -130,7 +144,11 @@ def quote_geolocation_webhook(
         geocode.GoogleGeocodeError,
         shapefile.ShapefileException,
     ) as exc:
+        logger.exception("Quote geolocation webhook failed for quote_id=%s: %s", payload.quote_id, exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover - defensive logging for unexpected runtime failures
+        logger.exception("Unexpected quote geolocation webhook failure for quote_id=%s", payload.quote_id)
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {exc}") from exc
 
 
 def create_app() -> FastAPI:
