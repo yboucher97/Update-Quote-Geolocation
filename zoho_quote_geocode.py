@@ -12,6 +12,7 @@ import time
 from contextlib import ExitStack
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlsplit, urlunsplit
@@ -2637,11 +2638,47 @@ def _build_region_lookup_configs(args: argparse.Namespace) -> list[RegionLookupC
 
 
 def _configure_logging(level_name: str) -> logging.Logger:
-    logging.basicConfig(
-        level=getattr(logging, level_name.upper(), logging.INFO),
-        format="%(levelname)s %(message)s",
-    )
-    return logging.getLogger("zoho-quote-geocode")
+    level = getattr(logging, level_name.upper(), logging.INFO)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+
+    if not root_logger.handlers:
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        console_handler.setLevel(level)
+        root_logger.addHandler(console_handler)
+    else:
+        for handler in root_logger.handlers:
+            handler.setLevel(level)
+            if handler.formatter is None:
+                handler.setFormatter(formatter)
+
+    log_dir_value = _read_env("ZOHO_QUOTE_LOG_DIR")
+    if log_dir_value:
+        log_dir = Path(log_dir_value).expanduser()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "quote-geolocation.log"
+        file_handler_exists = any(
+            isinstance(handler, RotatingFileHandler)
+            and Path(getattr(handler, "baseFilename", "")) == log_path
+            for handler in root_logger.handlers
+        )
+        if not file_handler_exists:
+            file_handler = RotatingFileHandler(
+                log_path,
+                maxBytes=2_000_000,
+                backupCount=5,
+                encoding="utf-8",
+            )
+            file_handler.setFormatter(formatter)
+            file_handler.setLevel(level)
+            root_logger.addHandler(file_handler)
+
+    logger = logging.getLogger("zoho-quote-geocode")
+    logger.setLevel(level)
+    return logger
 
 
 def main(argv: list[str] | None = None) -> int:

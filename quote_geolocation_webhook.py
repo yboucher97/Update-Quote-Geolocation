@@ -102,12 +102,15 @@ router = APIRouter()
 
 @router.get("/health")
 @router.get("/health/quote-geolocation")
+@router.get("/quote-geolocation/health")
 def health() -> dict[str, bool]:
     return {"ok": True}
 
 
 @router.post("/webhooks/quote-geolocation")
 @router.post("/webhooks/zoho/quote-geolocation")
+@router.post("/quote-geolocation/webhooks/quote-geolocation")
+@router.post("/quote-geolocation/webhooks/zoho/quote-geolocation")
 def quote_geolocation_webhook(
     payload: QuoteGeolocationWebhookRequest,
     x_webhook_secret: str | None = Header(default=None),
