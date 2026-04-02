@@ -10,14 +10,17 @@ PACKAGE_ROOT="${STAGE_DIR}/${PACKAGE_NAME}"
 APP_ROOT="${PACKAGE_ROOT}/usr/lib/${PACKAGE_NAME}"
 VENDOR_ROOT="${APP_ROOT}/vendor"
 WRAPPER_PATH="${PACKAGE_ROOT}/usr/bin/${PACKAGE_NAME}"
+CLI_WRAPPER_PATH="${PACKAGE_ROOT}/usr/bin/${PACKAGE_NAME}-cli"
 WEBHOOK_WRAPPER_PATH="${PACKAGE_ROOT}/usr/bin/${PACKAGE_NAME}-webhook"
 CONTROL_DIR="${PACKAGE_ROOT}/DEBIAN"
+SYSTEMD_DIR="${PACKAGE_ROOT}/lib/systemd/system"
+SYSTEMD_SERVICE_PATH="${SYSTEMD_DIR}/${PACKAGE_NAME}.service"
 DEB_PATH="${BUILD_ROOT}/${PACKAGE_NAME}_${PACKAGE_VERSION}_all.deb"
 MAINTAINER_NAME="${MAINTAINER_NAME:-yboucher97}"
 MAINTAINER_EMAIL="${MAINTAINER_EMAIL:-yboucher97@users.noreply.github.com}"
 
 rm -rf "${STAGE_DIR}" "${DEB_PATH}"
-mkdir -p "${APP_ROOT}" "${VENDOR_ROOT}" "${CONTROL_DIR}" "${PACKAGE_ROOT}/usr/bin" "${PACKAGE_ROOT}/etc/${PACKAGE_NAME}"
+mkdir -p "${APP_ROOT}" "${VENDOR_ROOT}" "${CONTROL_DIR}" "${PACKAGE_ROOT}/usr/bin" "${PACKAGE_ROOT}/etc/${PACKAGE_NAME}" "${SYSTEMD_DIR}"
 
 python3 -m pip install --upgrade pip
 python3 -m pip install --no-compile --target "${VENDOR_ROOT}" -r "${ROOT_DIR}/requirements.txt"
@@ -27,7 +30,7 @@ install -m 755 "${ROOT_DIR}/quote_geolocation_webhook.py" "${APP_ROOT}/quote_geo
 install -m 644 "${ROOT_DIR}/zoho_quote_geocode.env.example" "${PACKAGE_ROOT}/etc/${PACKAGE_NAME}/zoho_quote_geocode.env.example"
 install -m 644 "${ROOT_DIR}/README.md" "${APP_ROOT}/README.md"
 
-cat > "${WRAPPER_PATH}" <<EOF
+cat > "${CLI_WRAPPER_PATH}" <<EOF
 #!/bin/sh
 set -eu
 
@@ -56,9 +59,9 @@ export UPDATE_QUOTE_GEOLOCATION_VERSION="${PACKAGE_VERSION}"
 
 exec python3 "\${APP_DIR}/zoho_quote_geocode.py" "\$@"
 EOF
-chmod 755 "${WRAPPER_PATH}"
+chmod 755 "${CLI_WRAPPER_PATH}"
 
-cat > "${WEBHOOK_WRAPPER_PATH}" <<EOF
+cat > "${WRAPPER_PATH}" <<EOF
 #!/bin/sh
 set -eu
 
@@ -88,9 +91,18 @@ export UPDATE_QUOTE_GEOLOCATION_VERSION="${PACKAGE_VERSION}"
 HOST="\${ZOHO_QUOTE_WEBHOOK_HOST:-127.0.0.1}"
 PORT="\${ZOHO_QUOTE_WEBHOOK_PORT:-8050}"
 
+if [ "\${1:-}" = "--version" ]; then
+  exec python3 "\${APP_DIR}/zoho_quote_geocode.py" --version
+fi
+
 exec python3 -m uvicorn quote_geolocation_webhook:app --app-dir "\${APP_DIR}" --host "\${HOST}" --port "\${PORT}" "\$@"
 EOF
+chmod 755 "${WRAPPER_PATH}"
+
+cp "${WRAPPER_PATH}" "${WEBHOOK_WRAPPER_PATH}"
 chmod 755 "${WEBHOOK_WRAPPER_PATH}"
+
+install -m 644 "${ROOT_DIR}/packaging/update-quote-geolocation.service" "${SYSTEMD_SERVICE_PATH}"
 
 cat > "${CONTROL_DIR}/control" <<EOF
 Package: ${PACKAGE_NAME}
@@ -101,8 +113,8 @@ Architecture: all
 Maintainer: ${MAINTAINER_NAME} <${MAINTAINER_EMAIL}>
 Depends: python3
 Description: Zoho CRM quote geolocation updater
- Fetches quote shipping addresses from Zoho CRM, geocodes them with the
- Google Geocoding API, and updates latitude/longitude fields in Zoho CRM.
+ Receives quote IDs by webhook, geocodes quote shipping addresses with the
+ Google Geocoding API, resolves Quebec boundaries, and updates Zoho CRM.
 EOF
 
 cat > "${CONTROL_DIR}/postinst" <<EOF
@@ -118,6 +130,10 @@ mkdir -p "\${CONFIG_DIR}"
 if [ ! -f "\${TARGET_FILE}" ] && [ -f "\${EXAMPLE_FILE}" ]; then
   cp "\${EXAMPLE_FILE}" "\${TARGET_FILE}"
   chmod 600 "\${TARGET_FILE}"
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl daemon-reload >/dev/null 2>&1 || true
 fi
 EOF
 chmod 755 "${CONTROL_DIR}/postinst"

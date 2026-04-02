@@ -5,7 +5,7 @@ import os
 from contextlib import ExitStack
 
 from fastapi import APIRouter, FastAPI, Header, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 import shapefile
 
@@ -13,15 +13,9 @@ import zoho_quote_geocode as geocode
 
 
 class QuoteGeolocationWebhookRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     quote_id: str = Field(..., min_length=1, description="Zoho CRM quote record ID")
-    update_existing: bool = Field(
-        default=False,
-        description="When true, geocode even if latitude and longitude already exist.",
-    )
-    update_existing_region: bool = Field(
-        default=False,
-        description="When true, overwrite existing Region, MRC, Muni, and Arrondissement values.",
-    )
 
 
 def _ensure_webhook_secret(received_secret: str | None) -> None:
@@ -50,14 +44,11 @@ def _build_run_one_args(
 
 def _run_single_quote_from_webhook(
     quote_id: str,
-    *,
-    update_existing: bool,
-    update_existing_region: bool,
 ) -> dict:
     args, logger = _build_run_one_args(
         quote_id,
-        update_existing=update_existing,
-        update_existing_region=update_existing_region,
+        update_existing=False,
+        update_existing_region=False,
     )
     zoho_config, field_config = geocode._build_configs(args)
 
@@ -126,8 +117,6 @@ def quote_geolocation_webhook(
     try:
         return _run_single_quote_from_webhook(
             payload.quote_id,
-            update_existing=payload.update_existing,
-            update_existing_region=payload.update_existing_region,
         )
     except HTTPException:
         raise
